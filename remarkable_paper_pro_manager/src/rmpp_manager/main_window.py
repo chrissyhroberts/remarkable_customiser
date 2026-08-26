@@ -126,12 +126,6 @@ class DeployTab(QWidget):
         self.library_root = library_root
         self.thread: QThread | None = None
         self.worker: Worker | None = None
-
-        # Success callbacks must only execute on this QWidget's GUI thread.
-        # Connecting a worker signal directly to a Python lambda caused Qt
-        # widgets to be manipulated from the worker QThread on macOS.
-        self._success_callback: Callable[[object], None] | None = None
-
         self._build_ui()
         self._load_settings()
 
@@ -142,10 +136,10 @@ class DeployTab(QWidget):
         form = QFormLayout(connection)
         self.host = QLineEdit()
         self.user = QLineEdit()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Not saved; leave blank to use SSH key/agent")
         self.key_file = QLineEdit()
-        self.key_file.setPlaceholderText(
-            "Optional; leave blank to use SSH agent or ~/.ssh keys"
-        )
         key_row = QHBoxLayout()
         key_row.addWidget(self.key_file, 1)
         key_browse = QPushButton("Browse…")
@@ -153,6 +147,7 @@ class DeployTab(QWidget):
         key_row.addWidget(key_browse)
         form.addRow("Host", self.host)
         form.addRow("User", self.user)
+        form.addRow("Password", self.password)
         form.addRow("SSH key", key_row)
 
         test_button = QPushButton("Test connection")
@@ -273,6 +268,7 @@ class DeployTab(QWidget):
         return DeviceConfig(
             host=self.host.text().strip() or "192.168.86.87",
             user=self.user.text().strip() or "root",
+            password=self.password.text(),
             key_file=self.key_file.text().strip(),
         )
 
@@ -328,12 +324,8 @@ class DeployTab(QWidget):
         thread.started.connect(worker.run)
         worker.log.connect(self._append_log)
         worker.failed.connect(self._operation_failed)
-
-        # Store the callback, but route the worker result through a QObject
-        # slot owned by the GUI thread. Never run GUI lambdas in QThread.
-        self._success_callback = success
-        worker.succeeded.connect(self._operation_succeeded)
-
+        if success is not None:
+            worker.succeeded.connect(success)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -342,18 +334,10 @@ class DeployTab(QWidget):
         self.worker = worker
         thread.start()
 
-    @Slot(object)
-    def _operation_succeeded(self, result: object) -> None:
-        callback = self._success_callback
-        self._success_callback = None
-        if callback is not None:
-            callback(result)
-
     @Slot()
     def _thread_done(self) -> None:
         self.thread = None
         self.worker = None
-        self._success_callback = None
         self._set_busy(False)
 
     @Slot(str)

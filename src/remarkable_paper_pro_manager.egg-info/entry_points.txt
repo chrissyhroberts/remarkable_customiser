@@ -1,0 +1,2 @@
+[console_scripts]
+rmpp-manager = rmpp_manager.__main__:main

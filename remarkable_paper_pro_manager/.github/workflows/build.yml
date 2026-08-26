@@ -43,17 +43,8 @@ jobs:
             --noconfirm \
             --clean \
             --windowed \
-            --osx-bundle-identifier "com.chrissyhroberts.remarkable-customiser" \
             --name "reMarkable Paper Pro Manager" \
             packaging/launcher.py
-
-          /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleShortVersionString 0.2.1" \
-            "dist/reMarkable Paper Pro Manager.app/Contents/Info.plist"
-
-          /usr/libexec/PlistBuddy \
-            -c "Set :CFBundleVersion 0.2.1" \
-            "dist/reMarkable Paper Pro Manager.app/Contents/Info.plist"
 
       - name: Ad-hoc sign application
         run: |
@@ -105,7 +96,6 @@ jobs:
             --clean `
             --onefile `
             --windowed `
-            --version-file "packaging/version_info.txt" `
             --name "reMarkable Paper Pro Manager" `
             packaging/launcher.py
 
