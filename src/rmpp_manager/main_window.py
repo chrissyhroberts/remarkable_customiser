@@ -142,6 +142,9 @@ class DeployTab(QWidget):
         form = QFormLayout(connection)
         self.host = QLineEdit()
         self.user = QLineEdit()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("Optional; not saved")
         self.key_file = QLineEdit()
         self.key_file.setPlaceholderText(
             "Optional; leave blank to use SSH agent or ~/.ssh keys"
@@ -153,6 +156,7 @@ class DeployTab(QWidget):
         key_row.addWidget(key_browse)
         form.addRow("Host", self.host)
         form.addRow("User", self.user)
+        form.addRow("Password", self.password)
         form.addRow("SSH key", key_row)
 
         test_button = QPushButton("Test connection")
@@ -273,6 +277,7 @@ class DeployTab(QWidget):
         return DeviceConfig(
             host=self.host.text().strip() or "192.168.86.87",
             user=self.user.text().strip() or "root",
+            password=self.password.text(),
             key_file=self.key_file.text().strip(),
         )
 

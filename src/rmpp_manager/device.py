@@ -29,6 +29,7 @@ REMOTE_CAROUSEL = f"{REMOTE_ROOT}/carousel"
 class DeviceConfig:
     host: str = "192.168.86.87"
     user: str = "root"
+    password: str = ""
     key_file: str = ""
     port: int = 22
     timeout: float = 8.0
@@ -80,6 +81,8 @@ class RemoteSession:
             "look_for_keys": True,
             "allow_agent": True,
         }
+        if self.config.password:
+            kwargs["password"] = self.config.password
         if self.config.key_file:
             kwargs["key_filename"] = os.path.expanduser(self.config.key_file)
         try:

@@ -180,8 +180,10 @@ def _draw_item(
         position = item.get("position", {})
         x = float(safe_eval(position.get("x", 0), variables)) + dx
         y = float(safe_eval(position.get("y", 0), variables)) + dy
-        font = QFont()
+        font = QFont(str(item.get("_fontFamily", "")))
         font.setPointSizeF(max(1.0, float(item.get("fontSize", 24)) * 0.72))
+        font.setBold(bool(item.get("_bold", False)))
+        font.setItalic(bool(item.get("_italic", False)))
         painter.setFont(font)
         painter.setPen(QColor(item.get("color", "#000000")))
         painter.drawText(QPointF(x, y + font.pointSizeF()), str(item.get("text", "")))
