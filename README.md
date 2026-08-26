@@ -1,93 +1,229 @@
-# reMarkable Paper Pro Manager
+# reMarkable Customiser
 
-Desktop GUI for maintaining custom reMarkable Paper Pro templates, sleep screens, and sleep-carousel artwork over SSH.
+A desktop GUI for customising reMarkable Paper Pro system templates, suspend screens, and sleep-carousel artwork over SSH.
 
-The application is built around the native `.template` format in this repository, including the examples in `../Pro_Paper_template_new_format`.
+The application is designed around the native reMarkable `.template` format and provides both a deployment interface and a visual template designer.
 
-## What it does
+> **Warning**
+>
+> This application modifies files under `/usr/share/remarkable` as `root`. These modifications are not part of the officially supported reMarkable customisation workflow. Firmware updates may overwrite or change the files used by this application.
 
-### Device and deploy
+## Features
 
-- Defaults to `root@192.168.86.87`.
-- Uses SSH/SFTP directly; it does not automate a terminal window.
-- Tests the device connection before deployment.
-- Fetches the **live** `/usr/share/remarkable/templates/templates.json`.
-- Merges local template metadata into the live registry without dropping unknown fields.
-- Treats `filename + orientation` as the registry identity.
-- Leaves exact duplicates alone.
-- Flags conflicting entries before deployment.
-- Can blank all `sleep_Illustration_*.png` files currently present in `/usr/share/remarkable/carousel`.
-- Can upload a custom carousel folder instead.
-- Can replace `/usr/share/remarkable/suspended.png`.
-- Uploads native `.template` files to `/usr/share/remarkable/templates`.
-- Creates a timestamped local backup of every affected remote file before writing.
-- Remounts `/` read-write before changes.
-- Uploads through temporary files and renames them into place.
-- Runs `sync` and `systemctl restart xochitl`.
-- Attempts to remount `/` read-only afterwards.
-- Can restore one of its timestamped backups.
+### Device customisation
 
-### Template designer
+The deployment interface can:
 
-The second tab is a simple native-template authoring UI. It can create:
+- connect to a reMarkable over SSH;
+- authenticate with a password, SSH agent, default OpenSSH keys, or an explicitly selected private key;
+- test the connection before making changes;
+- replace the suspend screen at `/usr/share/remarkable/suspended.png`;
+- blank the current sleep-carousel illustrations;
+- upload custom carousel artwork;
+- upload native `.template` files;
+- fetch and merge the device's live `templates.json`;
+- preview intended changes before deployment;
+- create timestamped backups of affected files;
+- restore files from a previous backup;
+- restart `xochitl` after deployment.
 
-- horizontal and vertical lines
-- rectangles
-- circles (polygonal paths)
-- text labels
-- ruled sections
-- grids
-- dot grids
-- checklists
+The local suspend-screen image does **not** need to be named `suspended.png`. The application uploads the selected image to the correct fixed device path.
 
-Templates are previewed at Paper Pro or reMarkable 2 dimensions and saved into a local library. Saving also updates a local `templates.json` manifest so deployment can preserve deliberate names, icon codes, categories, and orientation.
+### Editable template designer
 
-The preview renderer supports native `path`, `text`, and repeated `group` constructs and evaluates template arithmetic with a restricted expression evaluator rather than Python `eval()`.
+The template designer creates native reMarkable templates without requiring hand-written template JSON.
 
-## Install from source
+Supported elements include:
+
+- horizontal lines;
+- vertical lines;
+- rectangles;
+- circles;
+- text;
+- ruled lines;
+- grids;
+- dot grids;
+- checklists.
+
+Elements remain individually editable after they are added. You can select an element and change its position, dimensions, scaling, spacing, stroke, text, font preview settings, and other type-specific properties.
+
+Elements can also be duplicated, deleted, moved up, and moved down.
+
+The preview updates as the design changes.
+
+## Template files and design files
+
+A template created in the designer is saved in two forms:
+
+```text
+My_Template.template
+My_Template.design.json
+```
+
+`My_Template.template` is the clean native template intended for deployment to the reMarkable.
+
+`My_Template.design.json` stores the semantic design model used by the desktop editor so that individual elements can be reopened and edited later.
+
+This separation is intentional: arbitrary native path data cannot always be reconstructed reliably into high-level objects such as grids or checklists.
+
+If an existing `.template` file has no corresponding `.design.json`, it can still be loaded as a non-editable base layer and new editable elements can be added on top.
+
+## Supported devices
+
+The preview system currently includes dimensions for:
+
+- reMarkable Paper Pro;
+- reMarkable 2.
+
+The deployment workflow has primarily been developed and tested against reMarkable Paper Pro.
+
+## Installation
 
 Python 3.11 or later is recommended.
 
+Clone the repository and install it in a virtual environment:
+
 ```bash
-cd paper_pro_manager
-python -m venv .venv
-source .venv/bin/activate       # macOS/Linux
-# .venv\Scripts\activate        # Windows
+git clone https://github.com/chrissyhroberts/remarkable_customiser.git
+cd remarkable_customiser
+
+python3 -m venv .venv
+source .venv/bin/activate
 
 python -m pip install --upgrade pip
 python -m pip install -e .
-rmpp-manager
 ```
 
-You can also run:
+Run the application with:
 
 ```bash
 python -m rmpp_manager
 ```
 
+or:
+
+```bash
+rmpp-manager
+```
+
+On Windows, activate the virtual environment with:
+
+```text
+.venv\Scripts\activate
+```
+
 ## SSH authentication
 
-The app remembers the host, username, SSH-key path, and selected local folders using Qt settings.
+The device tab supports password authentication, SSH agent authentication, keys in the usual OpenSSH locations, and an explicit private-key file.
 
-It deliberately **does not persist the root password**.
+The password field is masked and is not intended to be persisted in application settings.
 
-The easiest long-term setup is an SSH key accepted by the reMarkable. The app can use:
+The device host defaults to:
 
-- your SSH agent
-- keys in the normal OpenSSH locations
-- an explicitly selected private-key file
-- a password entered for the current session
+```text
+root@192.168.86.87
+```
 
-The first connection to a previously unknown device accepts its host key through Paramiko. If you want strict host-key management, add the device to your normal `known_hosts` file first.
+Change the IP address in the GUI if your reMarkable uses a different address.
 
-## Local library
+## Deployment architecture
 
-The default location is:
+The reMarkable root filesystem is normally mounted read-only. Deployment therefore uses deliberately separate SSH connections for the different stages of the operation.
+
+The workflow is:
+
+```text
+1. Connect and inspect the device
+2. Build the deployment plan
+3. Back up affected files
+4. Disconnect
+5. Connect and remount / read-write
+6. Verify the mount and shell write access
+7. Disconnect
+8. Establish a brand-new SSH connection
+9. Upload and verify files
+10. sync
+11. restart xochitl
+12. Disconnect
+13. Establish a cleanup connection
+14. Remount / read-only
+15. Verify the final mount state
+```
+
+The reconnect after remounting is deliberate. It avoids reusing the pre-remount transport for system-file writes.
+
+### File transfer
+
+SFTP is used for reading and backing up files.
+
+Writes use a normal SSH execution channel. Each upload is written to a temporary file, checked for the expected byte count, and then renamed into place.
+
+The deployment log records connection phases, root mount state, write-access checks, upload start and completion, byte counts, transfer progress, temporary-file verification, rename operations, `sync`, `xochitl` restart, and the final read-only remount.
+
+This is deliberately verbose so failures on different reMarkable firmware versions can be diagnosed.
+
+## Suspend screen
+
+Select any PNG in the GUI.
+
+It will be deployed as:
+
+```text
+/usr/share/remarkable/suspended.png
+```
+
+The application backs up the existing file before replacing it.
+
+## Sleep carousel
+
+The application can either leave the carousel unchanged, upload custom carousel files, or blank the currently installed sleep illustrations.
+
+Blank-carousel mode discovers files matching:
+
+```text
+/usr/share/remarkable/carousel/sleep_Illustration_*.png
+```
+
+Rather than assuming a fixed image size, it creates blank replacements using the dimensions of the files currently installed on the device.
+
+## Templates
+
+Native template files are installed under:
+
+```text
+/usr/share/remarkable/templates
+```
+
+The registry is:
+
+```text
+/usr/share/remarkable/templates/templates.json
+```
+
+The application fetches the **live** registry from the device before deployment. It does not overwrite it with a bundled copy.
+
+### Registry merge behaviour
+
+Template entries are matched using filename and orientation.
+
+The merge logic is designed to preserve device metadata and unknown fields:
+
+1. An identical existing entry is left unchanged.
+2. A matching filename/orientation with different metadata is treated as a conflict.
+3. The same display name with another filename or orientation produces a warning but does not necessarily prevent insertion.
+4. A genuinely new filename/orientation is appended.
+
+Conflicting entries are kept by default unless replacement is explicitly requested.
+
+## Local library and backups
+
+A typical local library looks like:
 
 ```text
 ~/Documents/reMarkable Templates/
 ├── templates/
 │   ├── My_Template.template
+│   ├── My_Template.design.json
 │   └── templates.json
 └── backups/
     └── 192.168.86.87/
@@ -95,129 +231,90 @@ The default location is:
             └── usr/share/remarkable/...
 ```
 
-A template created in the designer is always saved locally before it can be deployed.
+Backups preserve the remote path beneath the timestamped directory.
 
-## Template-folder behaviour
+## Safety
 
-When a selected folder contains a `templates.json`, metadata entries matching each `.template` filename are preserved exactly.
+The application takes several precautions before modifying the device:
 
-When there is no matching manifest entry, the app infers one from the native template:
+- fetches the live template registry;
+- validates registry JSON;
+- previews the deployment plan;
+- creates local backups;
+- remounts `/` read-write only for the deployment phase;
+- verifies shell write access after remounting;
+- writes via temporary files;
+- verifies uploaded byte counts;
+- runs `sync`;
+- restarts `xochitl`;
+- attempts a fresh cleanup connection even after failures;
+- remounts `/` read-only afterwards.
 
-- `name` from the template's `name`
-- `filename` from the `.template` stem
-- `categories` from the template
-- `landscape: true` for landscape templates
-- a conservative default icon code
+These measures reduce risk, but system modifications remain unsupported by reMarkable.
 
-The live device registry remains authoritative. The app never starts with a bundled copy of `templates.json` and overwrites the device with it.
+A firmware update may overwrite customisations, rename system files, change template behaviour, alter the carousel structure, or change the SSH environment.
 
-## Registry merge rules
-
-For each local entry:
-
-1. Same `filename` and same orientation, identical metadata: no change.
-2. Same `filename` and same orientation, different metadata: conflict.
-3. Same display name but different filename/orientation: warning, but the new entry may still be appended.
-4. New filename/orientation: append.
-
-By default, conflicts keep the device's existing entry. There is an explicit checkbox to replace conflicts.
-
-Unknown keys on existing device entries are retained.
-
-## Blank carousel behaviour
-
-"Blank carousel" discovers the current remote files matching:
-
-```text
-/usr/share/remarkable/carousel/sleep_Illustration_*.png
-```
-
-Each file is backed up first. The blank replacement is generated with the **same pixel dimensions** as the backed-up PNG, rather than assuming one hard-coded firmware image size.
-
-## Safety and firmware updates
-
-This application modifies files under `/usr/share/remarkable` as root. These files are outside the supported reMarkable customisation workflow.
-
-Consequences include:
-
-- a firmware update may overwrite the changes;
-- a firmware release may rename or restructure files;
-- malformed templates or registry data can make the xochitl UI behave incorrectly;
-- root filesystem modifications always carry some risk.
-
-The application therefore fetches the live registry, validates JSON, backs up affected files before writes, uses temporary uploads, and provides a restore operation. Those precautions reduce risk; they do not make the modifications officially supported.
-
-Before using a new firmware release, use **Preview changes** and confirm that the expected remote paths still exist.
-
-## Packaging
-
-PyInstaller is included in the development extras:
-
-```bash
-python -m pip install -e '.[dev]'
-pyinstaller --noconfirm --windowed --name "reMarkable Paper Pro Manager" \
-  src/rmpp_manager/__main__.py
-```
-
-Build separately on macOS and Windows. PyInstaller does not cross-compile between those platforms.
+After a firmware update, use **Test connection** and **Preview changes** before deploying anything.
 
 ## Development
 
+Install the development dependencies:
+
 ```bash
 python -m pip install -e '.[dev]'
-pytest
 ```
 
-The deployment layer is isolated from the Qt UI in `device.py`, and registry logic is isolated in `registry.py`, so the high-risk parts can be tested without a reMarkable connected.
+Run the tests:
 
-## GitHub Actions desktop builds
+```bash
+python -m pytest -q
+```
 
-The repository includes `.github/workflows/build.yml`. GitHub Actions builds the application natively on each target operating system rather than attempting to cross-compile PyInstaller bundles.
-
-Every push to `main`, pull request to `main`, and manual workflow run builds and tests:
-
-- **macOS Apple Silicon (arm64)** on `macos-15`;
-- **Windows x64** on `windows-latest`.
-
-The workflow uploads two downloadable Actions artifacts:
+The main implementation is separated into components including:
 
 ```text
-remarkable-paper-pro-manager-macos-arm64.zip
-remarkable-paper-pro-manager-windows-x64.zip
+src/rmpp_manager/
+├── main_window.py
+├── device.py
+├── registry.py
+├── template_engine.py
+├── design_model.py
+└── editor.py
 ```
 
-The Windows archive contains a single `reMarkable Paper Pro Manager.exe`. The macOS archive contains `reMarkable Paper Pro Manager.app`.
+The separation between Qt UI code, device operations, registry merging, rendering, and the semantic design model is intentional so the more destructive operations can be tested independently.
 
-### Publishing a release
+## Desktop builds
 
-Push a version tag to create both builds and publish them automatically as a GitHub Release:
+GitHub Actions builds native desktop packages for:
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
+- macOS Apple Silicon;
+- Windows x64.
+
+PyInstaller is used to package the application.
+
+The macOS build is ad-hoc signed but is not currently Developer ID signed or notarised. macOS may therefore display a Gatekeeper warning for downloaded releases.
+
+The Windows executable is not currently Authenticode-signed, so Windows SmartScreen may warn on first launch.
+
+## Releases
+
+Version information is defined in `pyproject.toml`.
+
+Tagged releases use tags of the form:
+
+```text
+v0.2.3
 ```
 
-The `publish-release` job waits for both platform builds and then attaches both ZIP files to the release.
+A tagged GitHub Actions run builds the macOS and Windows packages and attaches them to the corresponding GitHub Release.
 
-### macOS signing
+## Licence
 
-The CI build receives an **ad-hoc code signature** so the `.app` bundle is internally consistent, but it is not Developer ID signed or Apple-notarized. Users downloading it from GitHub may therefore still see a Gatekeeper warning. Proper public distribution would require an Apple Developer certificate and notarization secrets to be configured in the repository.
+See [`LICENSE`](LICENSE).
 
-### Windows signing
+## Acknowledgements
 
-The Windows executable is not Authenticode-signed. Windows SmartScreen may therefore warn on first launch. Code signing can be added later if public distribution warrants it.
+The project grew out of work on native reMarkable Paper Pro template customisation and the template structures explored in:
 
-### Starting a fresh repository
-
-If this folder is being used as the initial contents of a new GitHub repository:
-
-```bash
-git init
-git add .
-git commit -m "Initial reMarkable Paper Pro Manager"
-git branch -M main
-git remote add origin <YOUR-NEW-REPOSITORY-URL>
-git push -u origin main
-```
-
-Once pushed, open **Actions → Build desktop apps**. A normal push to `main` will already have triggered the first macOS and Windows builds.
+[`chrissyhroberts/remarkable_2_and_paper_pro_custom_templates`](https://github.com/chrissyhroberts/remarkable_2_and_paper_pro_custom_templates)
