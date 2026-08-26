@@ -1,0 +1,223 @@
+# reMarkable Paper Pro Manager
+
+Desktop GUI for maintaining custom reMarkable Paper Pro templates, sleep screens, and sleep-carousel artwork over SSH.
+
+The application is built around the native `.template` format in this repository, including the examples in `../Pro_Paper_template_new_format`.
+
+## What it does
+
+### Device and deploy
+
+- Defaults to `root@192.168.86.87`.
+- Uses SSH/SFTP directly; it does not automate a terminal window.
+- Tests the device connection before deployment.
+- Fetches the **live** `/usr/share/remarkable/templates/templates.json`.
+- Merges local template metadata into the live registry without dropping unknown fields.
+- Treats `filename + orientation` as the registry identity.
+- Leaves exact duplicates alone.
+- Flags conflicting entries before deployment.
+- Can blank all `sleep_Illustration_*.png` files currently present in `/usr/share/remarkable/carousel`.
+- Can upload a custom carousel folder instead.
+- Can replace `/usr/share/remarkable/suspended.png`.
+- Uploads native `.template` files to `/usr/share/remarkable/templates`.
+- Creates a timestamped local backup of every affected remote file before writing.
+- Remounts `/` read-write before changes.
+- Uploads through temporary files and renames them into place.
+- Runs `sync` and `systemctl restart xochitl`.
+- Attempts to remount `/` read-only afterwards.
+- Can restore one of its timestamped backups.
+
+### Template designer
+
+The second tab is a simple native-template authoring UI. It can create:
+
+- horizontal and vertical lines
+- rectangles
+- circles (polygonal paths)
+- text labels
+- ruled sections
+- grids
+- dot grids
+- checklists
+
+Templates are previewed at Paper Pro or reMarkable 2 dimensions and saved into a local library. Saving also updates a local `templates.json` manifest so deployment can preserve deliberate names, icon codes, categories, and orientation.
+
+The preview renderer supports native `path`, `text`, and repeated `group` constructs and evaluates template arithmetic with a restricted expression evaluator rather than Python `eval()`.
+
+## Install from source
+
+Python 3.11 or later is recommended.
+
+```bash
+cd paper_pro_manager
+python -m venv .venv
+source .venv/bin/activate       # macOS/Linux
+# .venv\Scripts\activate        # Windows
+
+python -m pip install --upgrade pip
+python -m pip install -e .
+rmpp-manager
+```
+
+You can also run:
+
+```bash
+python -m rmpp_manager
+```
+
+## SSH authentication
+
+The app remembers the host, username, SSH-key path, and selected local folders using Qt settings.
+
+It deliberately **does not persist the root password**.
+
+The easiest long-term setup is an SSH key accepted by the reMarkable. The app can use:
+
+- your SSH agent
+- keys in the normal OpenSSH locations
+- an explicitly selected private-key file
+- a password entered for the current session
+
+The first connection to a previously unknown device accepts its host key through Paramiko. If you want strict host-key management, add the device to your normal `known_hosts` file first.
+
+## Local library
+
+The default location is:
+
+```text
+~/Documents/reMarkable Templates/
+├── templates/
+│   ├── My_Template.template
+│   └── templates.json
+└── backups/
+    └── 192.168.86.87/
+        └── YYYY-MM-DD_HHMMSS/
+            └── usr/share/remarkable/...
+```
+
+A template created in the designer is always saved locally before it can be deployed.
+
+## Template-folder behaviour
+
+When a selected folder contains a `templates.json`, metadata entries matching each `.template` filename are preserved exactly.
+
+When there is no matching manifest entry, the app infers one from the native template:
+
+- `name` from the template's `name`
+- `filename` from the `.template` stem
+- `categories` from the template
+- `landscape: true` for landscape templates
+- a conservative default icon code
+
+The live device registry remains authoritative. The app never starts with a bundled copy of `templates.json` and overwrites the device with it.
+
+## Registry merge rules
+
+For each local entry:
+
+1. Same `filename` and same orientation, identical metadata: no change.
+2. Same `filename` and same orientation, different metadata: conflict.
+3. Same display name but different filename/orientation: warning, but the new entry may still be appended.
+4. New filename/orientation: append.
+
+By default, conflicts keep the device's existing entry. There is an explicit checkbox to replace conflicts.
+
+Unknown keys on existing device entries are retained.
+
+## Blank carousel behaviour
+
+"Blank carousel" discovers the current remote files matching:
+
+```text
+/usr/share/remarkable/carousel/sleep_Illustration_*.png
+```
+
+Each file is backed up first. The blank replacement is generated with the **same pixel dimensions** as the backed-up PNG, rather than assuming one hard-coded firmware image size.
+
+## Safety and firmware updates
+
+This application modifies files under `/usr/share/remarkable` as root. These files are outside the supported reMarkable customisation workflow.
+
+Consequences include:
+
+- a firmware update may overwrite the changes;
+- a firmware release may rename or restructure files;
+- malformed templates or registry data can make the xochitl UI behave incorrectly;
+- root filesystem modifications always carry some risk.
+
+The application therefore fetches the live registry, validates JSON, backs up affected files before writes, uses temporary uploads, and provides a restore operation. Those precautions reduce risk; they do not make the modifications officially supported.
+
+Before using a new firmware release, use **Preview changes** and confirm that the expected remote paths still exist.
+
+## Packaging
+
+PyInstaller is included in the development extras:
+
+```bash
+python -m pip install -e '.[dev]'
+pyinstaller --noconfirm --windowed --name "reMarkable Paper Pro Manager" \
+  src/rmpp_manager/__main__.py
+```
+
+Build separately on macOS and Windows. PyInstaller does not cross-compile between those platforms.
+
+## Development
+
+```bash
+python -m pip install -e '.[dev]'
+pytest
+```
+
+The deployment layer is isolated from the Qt UI in `device.py`, and registry logic is isolated in `registry.py`, so the high-risk parts can be tested without a reMarkable connected.
+
+## GitHub Actions desktop builds
+
+The repository includes `.github/workflows/build.yml`. GitHub Actions builds the application natively on each target operating system rather than attempting to cross-compile PyInstaller bundles.
+
+Every push to `main`, pull request to `main`, and manual workflow run builds and tests:
+
+- **macOS Apple Silicon (arm64)** on `macos-15`;
+- **Windows x64** on `windows-latest`.
+
+The workflow uploads two downloadable Actions artifacts:
+
+```text
+remarkable-paper-pro-manager-macos-arm64.zip
+remarkable-paper-pro-manager-windows-x64.zip
+```
+
+The Windows archive contains a single `reMarkable Paper Pro Manager.exe`. The macOS archive contains `reMarkable Paper Pro Manager.app`.
+
+### Publishing a release
+
+Push a version tag to create both builds and publish them automatically as a GitHub Release:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The `publish-release` job waits for both platform builds and then attaches both ZIP files to the release.
+
+### macOS signing
+
+The CI build receives an **ad-hoc code signature** so the `.app` bundle is internally consistent, but it is not Developer ID signed or Apple-notarized. Users downloading it from GitHub may therefore still see a Gatekeeper warning. Proper public distribution would require an Apple Developer certificate and notarization secrets to be configured in the repository.
+
+### Windows signing
+
+The Windows executable is not Authenticode-signed. Windows SmartScreen may therefore warn on first launch. Code signing can be added later if public distribution warrants it.
+
+### Starting a fresh repository
+
+If this folder is being used as the initial contents of a new GitHub repository:
+
+```bash
+git init
+git add .
+git commit -m "Initial reMarkable Paper Pro Manager"
+git branch -M main
+git remote add origin <YOUR-NEW-REPOSITORY-URL>
+git push -u origin main
+```
+
+Once pushed, open **Actions → Build desktop apps**. A normal push to `main` will already have triggered the first macOS and Windows builds.
