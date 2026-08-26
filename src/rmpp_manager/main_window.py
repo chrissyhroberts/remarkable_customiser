@@ -372,9 +372,10 @@ class DeployTab(QWidget):
         QMessageBox.critical(self, "Operation failed", headline)
 
     def test_device(self) -> None:
+        config = self._config()
         self._append_log("Testing SSH connection…")
         self._start(
-            lambda: test_connection(self._config()),
+            lambda: test_connection(config),
             success=lambda result: self._connection_ok(str(result)),
         )
 
@@ -383,9 +384,11 @@ class DeployTab(QWidget):
         QMessageBox.information(self, "Connected", result[:1000])
 
     def preview(self) -> None:
+        config = self._config()
+        spec = self._spec()
         self._append_log("Fetching live template registry and building preview…")
         self._start(
-            lambda: build_plan(self._config(), self._spec()),
+            lambda: build_plan(config, spec),
             success=lambda result: PlanDialog(result, self).exec(),
         )
 
