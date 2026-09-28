@@ -1,74 +1,122 @@
-from pathlib import Path
-
 from rmpp_manager.registry import merge_registry
 
 
-def test_merge_appends_new_entry_without_dropping_remote_fields():
+def test_new_custom_entry_is_inserted_without_losing_device_data():
     remote = {
         "vendorKey": "keep-me",
         "templates": [
             {
                 "name": "Blank",
                 "filename": "Blank",
-                "iconCode": "\ue9fe",
+                "iconCode": "\\ue9fe",
                 "categories": ["Creative"],
                 "supportedScreens": ["rmPP"],
-            }
+            },
+            {
+                "name": "Blank",
+                "filename": "Blank",
+                "iconCode": "\\ue9fd",
+                "landscape": True,
+                "categories": ["Creative"],
+            },
+            {
+                "name": "Stock",
+                "filename": "Stock",
+                "iconCode": "\\ue9aa",
+                "categories": ["Lines"],
+            },
         ],
     }
+
     local = [
         {
             "name": "Chrissy Notes",
             "filename": "Chrissy_Notes",
-            "iconCode": "\ue9b9",
-            "categories": ["Lines"],
+            "iconCode": "\\ue9ab",
+            "landscape": False,
+            "categories": ["Life/organize"],
         }
     ]
 
     result = merge_registry(remote, local)
 
     assert result.merged["vendorKey"] == "keep-me"
-    assert result.merged["templates"][0]["supportedScreens"] == ["rmPP"]
-    assert result.merged["templates"][-1]["filename"] == "Chrissy_Notes"
+    assert (
+        result.merged["templates"][0]["supportedScreens"]
+        == ["rmPP"]
+    )
+
     assert len(result.added) == 1
+    assert not result.updated
+
+    # Custom entries go immediately after the Blank variants.
+    assert (
+        result.merged["templates"][2]["filename"]
+        == "Chrissy_Notes"
+    )
+    assert (
+        result.merged["templates"][3]["filename"]
+        == "Stock"
+    )
 
 
 def test_exact_duplicate_is_unchanged():
     entry = {
         "name": "Dots",
         "filename": "Dots",
-        "iconCode": "\ue9b9",
+        "iconCode": "\\ue9b9",
         "categories": ["Grids"],
     }
-    result = merge_registry({"templates": [entry]}, [entry])
+
+    result = merge_registry(
+        {"templates": [entry]},
+        [entry],
+    )
+
     assert not result.added
+    assert not result.updated
     assert len(result.unchanged) == 1
-    assert not result.conflicts
 
 
-def test_same_filename_and_orientation_is_conflict_by_default():
+def test_existing_custom_entry_is_updated_in_place():
     remote = {
         "templates": [
             {
-                "name": "Old",
-                "filename": "Notes",
-                "iconCode": "\ue9b9",
+                "name": "Old display name",
+                "filename": "Chrissy_Notes",
+                "iconCode": "\\ue9b9",
                 "categories": ["Lines"],
+                "supportedScreens": ["rmPP"],
+                "firmwareField": "preserve-me",
             }
         ]
     }
+
     local = [
         {
-            "name": "New",
-            "filename": "Notes",
-            "iconCode": "\ue9b9",
-            "categories": ["Creative"],
+            "name": "Chrissy Notes",
+            "filename": "Chrissy_Notes",
+            "iconCode": "\\ue9ab",
+            "landscape": False,
+            "categories": ["Life/organize"],
         }
     ]
 
     result = merge_registry(remote, local)
-    assert len(result.conflicts) == 1
-    assert result.merged["templates"][0]["name"] == "Old"
+
+    assert not result.added
+    assert len(result.updated) == 1
+
+    merged = result.merged["templates"][0]
+
+    assert merged["name"] == "Chrissy Notes"
+    assert merged["iconCode"] == "\\ue9ab"
+    assert merged["categories"] == ["Life/organize"]
+    assert merged["landscape"] is False
+
+    # Device-only data survives the custom metadata update.
+    assert merged["supportedScreens"] == ["rmPP"]
+    assert merged["firmwareField"] == "preserve-me"
 
 
 def test_landscape_variant_is_distinct():
@@ -77,21 +125,50 @@ def test_landscape_variant_is_distinct():
             {
                 "name": "Dots",
                 "filename": "Dots",
-                "iconCode": "\ue9b9",
+                "iconCode": "\\ue9b9",
                 "categories": ["Grids"],
             }
         ]
     }
+
     local = [
         {
-            "name": "Dots",
+            "name": "Dots landscape",
             "filename": "Dots",
-            "iconCode": "\ue9b9",
+            "iconCode": "\\ue9f9",
             "landscape": True,
             "categories": ["Grids"],
         }
     ]
 
     result = merge_registry(remote, local)
+
     assert len(result.added) == 1
     assert len(result.merged["templates"]) == 2
+
+
+def test_original_remote_registry_is_not_mutated():
+    remote = {
+        "templates": [
+            {
+                "name": "Stock",
+                "filename": "Stock",
+                "iconCode": "\\ue9aa",
+                "categories": ["Lines"],
+            }
+        ]
+    }
+
+    local = [
+        {
+            "name": "Custom",
+            "filename": "Custom",
+            "iconCode": "\\ue9ab",
+            "categories": ["Life/organize"],
+        }
+    ]
+
+    merge_registry(remote, local)
+
+    assert len(remote["templates"]) == 1
+    assert remote["templates"][0]["filename"] == "Stock"

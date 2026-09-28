@@ -17,7 +17,12 @@ from typing import Any, Callable
 import paramiko
 from PIL import Image
 
-from .registry import RegistryMerge, discover_local_templates, merge_registry
+from .registry import (
+    RegistryMerge,
+    discover_local_templates,
+    entry_key,
+    merge_registry,
+)
 
 
 REMOTE_ROOT = "/usr/share/remarkable"
@@ -52,6 +57,7 @@ class DeploymentPlan:
     remote_registry: dict[str, Any]
     merged_registry: dict[str, Any]
     registry_merge: RegistryMerge | None
+    template_entries: list[dict[str, Any]] = field(default_factory=list)
     template_assets: list[Path] = field(default_factory=list)
     carousel_remote_files: list[str] = field(default_factory=list)
     carousel_custom_files: list[Path] = field(default_factory=list)
@@ -335,41 +341,55 @@ def build_plan(
             raise DeviceError(f"Unknown carousel mode: {spec.carousel_mode}")
 
         if spec.template_folder is not None:
-            assets, entries = discover_local_templates(spec.template_folder)
-            if not assets:
-                plan.warnings.append("The selected template folder contains no .template files.")
-            merge = merge_registry(
-                registry,
-                entries,
-                replace_conflicts=spec.replace_registry_conflicts,
+            assets, entries = discover_local_templates(
+                spec.template_folder
             )
-            plan.registry_merge = merge
-            plan.merged_registry = merge.merged
-            if merge.conflicts and not spec.replace_registry_conflicts:
-                conflict_filenames = {
-                    str(local.get("filename", ""))
-                    for _remote, local in merge.conflicts
-                }
-                plan.template_assets = [
-                    asset for asset in assets if asset.stem not in conflict_filenames
-                ]
-                skipped = len(assets) - len(plan.template_assets)
-                if skipped:
-                    plan.warnings.append(
-                        f"Skipped {skipped} local template file(s) whose registry entries conflict "
-                        "with the live device. Enable conflict replacement to upload them."
-                    )
+
+            plan.template_assets = assets
+            plan.template_entries = entries
+
+            if not assets:
+                plan.warnings.append(
+                    "The selected template folder contains no .template files."
+                )
             else:
-                plan.template_assets = assets
-            plan.actions.append(f"Upload {len(plan.template_assets)} native template file(s)")
-            plan.actions.append(f"Add {len(merge.added)} registry entr{'y' if len(merge.added) == 1 else 'ies'}")
-            if merge.unchanged:
-                plan.actions.append(f"Leave {len(merge.unchanged)} already-identical registry entr{'y' if len(merge.unchanged) == 1 else 'ies'} unchanged")
-            if merge.conflicts:
-                behaviour = "replace" if spec.replace_registry_conflicts else "keep device version of"
-                plan.warnings.append(f"{len(merge.conflicts)} registry conflict(s): deployment will {behaviour} those entries.")
-            if merge.name_collisions:
-                plan.warnings.append(f"{len(merge.name_collisions)} name collision(s) use different filenames/orientations.")
+                merge = merge_registry(
+                    registry,
+                    entries,
+                    replace_conflicts=True,
+                )
+
+                plan.registry_merge = merge
+                plan.merged_registry = merge.merged
+
+                plan.actions.append(
+                    f"Upload {len(assets)} native template file(s)"
+                )
+                plan.actions.append(
+                    f"Add {len(merge.added)} custom registry entries"
+                )
+
+                if merge.updated:
+                    plan.actions.append(
+                        f"Update {len(merge.updated)} existing registry entries"
+                    )
+
+                if merge.unchanged:
+                    plan.actions.append(
+                        f"Leave {len(merge.unchanged)} identical registry "
+                        "entries unchanged"
+                    )
+
+                plan.actions.append(
+                    f"Verify {len(entries)} custom registry entries "
+                    "after upload"
+                )
+
+                if merge.name_collisions:
+                    plan.warnings.append(
+                        f"{len(merge.name_collisions)} display-name "
+                        "collision(s) use different filenames/orientations."
+                    )
 
         if not plan.actions:
             plan.warnings.append("Nothing is selected for deployment.")
@@ -391,6 +411,67 @@ def _make_blank_like(path: Path) -> bytes:
         buffer = io.BytesIO()
         blank.save(buffer, format="PNG")
         return buffer.getvalue()
+
+
+def _verify_registry_entries(
+    registry: dict[str, Any],
+    expected_entries: list[dict[str, Any]],
+) -> None:
+    """Confirm every deployed custom entry exists in the live registry."""
+
+    templates = registry.get("templates")
+
+    if not isinstance(templates, list):
+        raise DeviceError(
+            "Registry verification failed: device templates.json "
+            "does not contain a templates list."
+        )
+
+    actual_by_key: dict[
+        tuple[str, bool],
+        dict[str, Any],
+    ] = {}
+
+    for entry in templates:
+        if isinstance(entry, dict):
+            actual_by_key.setdefault(
+                entry_key(entry),
+                entry,
+            )
+
+    failures: list[str] = []
+
+    for expected in expected_entries:
+        key = entry_key(expected)
+        actual = actual_by_key.get(key)
+        filename = str(
+            expected.get("filename", "(unnamed)")
+        )
+
+        if actual is None:
+            failures.append(
+                f"{filename}: missing from live templates.json"
+            )
+            continue
+
+        mismatches = [
+            field
+            for field, value in expected.items()
+            if actual.get(field) != value
+        ]
+
+        if mismatches:
+            failures.append(
+                f"{filename}: metadata mismatch in "
+                + ", ".join(mismatches)
+            )
+
+    if failures:
+        raise DeviceError(
+            "Registry verification failed after upload:\n  - "
+            + "\n  - ".join(failures)
+        )
+
 
 
 def deploy(
@@ -469,9 +550,73 @@ def deploy(
                 remote.upload_atomic(asset, posixpath.join(REMOTE_TEMPLATES, asset.name))
 
             if plan.registry_merge is not None:
+                emit(
+                    "Registry merge: "
+                    f"added={len(plan.registry_merge.added)}, "
+                    f"updated={len(plan.registry_merge.updated)}, "
+                    f"unchanged={len(plan.registry_merge.unchanged)}, "
+                    f"final={len(plan.merged_registry.get('templates', []))}"
+                )
+
+                for entry in plan.template_entries:
+                    emit(
+                        "Manifest entry: "
+                        f"{entry.get('name')} -> "
+                        f"{entry.get('filename')}"
+                        + (
+                            " [landscape]"
+                            if entry.get("landscape")
+                            else ""
+                        )
+                    )
+
                 emit("Uploading merged templates.json")
-                payload = (json.dumps(plan.merged_registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-                remote.upload_bytes_atomic(payload, REMOTE_REGISTRY)
+
+                payload = (
+                    json.dumps(
+                        plan.merged_registry,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+
+                remote.upload_bytes_atomic(
+                    payload,
+                    REMOTE_REGISTRY,
+                )
+
+                emit(
+                    "Reading templates.json back from device "
+                    "for verification"
+                )
+
+                _code, registry_text, _err = remote.exec(
+                    f"cat {shlex.quote(REMOTE_REGISTRY)}",
+                    timeout=30.0,
+                )
+
+                try:
+                    live_registry = json.loads(
+                        registry_text
+                    )
+                except json.JSONDecodeError as exc:
+                    raise DeviceError(
+                        "Device templates.json is invalid after "
+                        f"upload: {exc}"
+                    ) from exc
+
+                _verify_registry_entries(
+                    live_registry,
+                    plan.template_entries,
+                )
+
+                emit(
+                    "Registry verification PASSED: "
+                    f"{len(plan.template_entries)}/"
+                    f"{len(plan.template_entries)} "
+                    "custom entries present"
+                )
 
             emit("sync")
             remote.exec("sync", timeout=60.0)

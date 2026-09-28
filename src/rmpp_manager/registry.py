@@ -15,6 +15,7 @@ DEFAULT_ICON_CODE = "\ue9b9"
 class RegistryMerge:
     merged: dict[str, Any]
     added: list[dict[str, Any]] = field(default_factory=list)
+    updated: list[dict[str, Any]] = field(default_factory=list)
     unchanged: list[dict[str, Any]] = field(default_factory=list)
     conflicts: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
     name_collisions: list[tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=list)
@@ -38,53 +39,120 @@ def merge_registry(
     *,
     replace_conflicts: bool = False,
 ) -> RegistryMerge:
-    """Merge local entries into the live device registry without dropping unknown fields.
+    """Upsert custom entries into the live reMarkable registry.
 
-    Identity is filename + orientation. Exact duplicates are left untouched.
-    A different entry with the same identity is reported as a conflict. By default
-    the live-device entry wins; callers may explicitly request replacement.
+    The live device registry is always the base document. Existing device
+    entries, ordering and unknown fields are preserved as far as possible.
+
+    Identity is filename + orientation. If a selected custom template already
+    exists, fields supplied by the local custom entry update that entry in
+    place while device-only fields are retained.
+
+    replace_conflicts is retained for backwards compatibility with older
+    callers; selected custom templates are now always upserted.
     """
+    del replace_conflicts
+
     merged = deepcopy(remote_registry)
-    remote_templates = list(merged.get("templates", []))
-    if not isinstance(remote_templates, list):
-        raise ValueError("Remote templates.json does not contain a 'templates' list.")
+    raw_templates = merged.get("templates", [])
+
+    if not isinstance(raw_templates, list):
+        raise ValueError(
+            "Remote templates.json does not contain a 'templates' list."
+        )
+
+    remote_templates: list[dict[str, Any]] = []
+
+    for entry in raw_templates:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "Remote templates.json contains a non-object template entry."
+            )
+        remote_templates.append(deepcopy(entry))
 
     result = RegistryMerge(merged=merged)
-    by_key = {entry_key(entry): i for i, entry in enumerate(remote_templates)}
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for entry in remote_templates:
-        by_name.setdefault(str(entry.get("name", "")).strip(), []).append(entry)
+
+    def reindex() -> tuple[
+        dict[tuple[str, bool], int],
+        dict[str, list[dict[str, Any]]],
+    ]:
+        by_key: dict[tuple[str, bool], int] = {}
+        by_name: dict[str, list[dict[str, Any]]] = {}
+
+        for index, entry in enumerate(remote_templates):
+            by_key.setdefault(entry_key(entry), index)
+            by_name.setdefault(
+                str(entry.get("name", "")).strip(),
+                [],
+            ).append(entry)
+
+        return by_key, by_name
+
+    by_key, by_name = reindex()
+
+    # Known-working manifests place custom entries immediately after the
+    # stock Blank portrait/landscape entries. Preserve everything else.
+    blank_indexes = [
+        index
+        for index, entry in enumerate(remote_templates)
+        if str(entry.get("filename", "")).strip() == "Blank"
+    ]
+
+    insert_at = (
+        max(blank_indexes) + 1
+        if blank_indexes
+        else len(remote_templates)
+    )
 
     for local in local_entries:
+        if not isinstance(local, dict):
+            raise ValueError(
+                f"Template entry is not an object: {local!r}"
+            )
+
         candidate = deepcopy(local)
         key = entry_key(candidate)
+
         if not key[0]:
-            raise ValueError(f"Template entry has no filename: {candidate!r}")
+            raise ValueError(
+                f"Template entry has no filename: {candidate!r}"
+            )
 
         if key in by_key:
-            idx = by_key[key]
-            remote = remote_templates[idx]
-            if canonical(remote) == canonical(candidate):
+            index = by_key[key]
+            existing = remote_templates[index]
+
+            if canonical(existing) == canonical(candidate):
                 result.unchanged.append(candidate)
-            else:
-                result.conflicts.append((remote, candidate))
-                if replace_conflicts:
-                    remote_templates[idx] = candidate
+                continue
+
+            # Custom metadata wins for fields it supplies. Any additional
+            # firmware/device metadata remains intact.
+            updated = deepcopy(existing)
+            updated.update(candidate)
+
+            remote_templates[index] = updated
+            result.updated.append(deepcopy(updated))
+
+            by_key, by_name = reindex()
             continue
 
         name = str(candidate.get("name", "")).strip()
-        for remote in by_name.get(name, []):
-            if entry_key(remote) != key:
-                result.name_collisions.append((remote, candidate))
 
-        remote_templates.append(candidate)
-        by_key[key] = len(remote_templates) - 1
-        by_name.setdefault(name, []).append(candidate)
-        result.added.append(candidate)
+        for existing in by_name.get(name, []):
+            if entry_key(existing) != key:
+                result.name_collisions.append(
+                    (deepcopy(existing), deepcopy(candidate))
+                )
+
+        remote_templates.insert(insert_at, candidate)
+        insert_at += 1
+
+        result.added.append(deepcopy(candidate))
+        by_key, by_name = reindex()
 
     merged["templates"] = remote_templates
     return result
-
 
 def _manifest_entries(folder: Path) -> list[dict[str, Any]]:
     manifest = folder / "templates.json"
