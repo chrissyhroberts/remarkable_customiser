@@ -1,4 +1,6 @@
-from rmpp_manager.registry import merge_registry
+import json
+
+from rmpp_manager.registry import discover_local_templates, merge_registry
 
 
 def test_new_custom_entry_is_inserted_without_losing_device_data():
@@ -172,3 +174,34 @@ def test_original_remote_registry_is_not_mutated():
 
     assert len(remote["templates"]) == 1
     assert remote["templates"][0]["filename"] == "Stock"
+
+
+
+def test_fallback_registry_name_comes_from_filename(tmp_path):
+    template = tmp_path / "Chrissy_Notes.template"
+
+    template.write_text(
+        json.dumps(
+            {
+                "name": "Weekplanner 1",
+                "author": "reMarkable",
+                "templateVersion": "1.0.0",
+                "formatVersion": 1,
+                "categories": ["Creative"],
+                "orientation": "portrait",
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assets, entries = discover_local_templates(tmp_path)
+
+    assert assets == [template]
+    assert len(entries) == 1
+
+    # The native template may retain the name of the stock template it was
+    # derived from. Registry discovery must instead generate a unique,
+    # human-readable display name from the custom filename.
+    assert entries[0]["name"] == "Chrissy Notes"
+    assert entries[0]["filename"] == "Chrissy_Notes"

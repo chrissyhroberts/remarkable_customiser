@@ -198,8 +198,18 @@ def discover_local_templates(folder: Path) -> tuple[list[Path], list[dict[str, A
             continue
 
         categories = template.get("categories") or ["Creative"]
+
+        # Do not use the native template's internal name as the registry
+        # display name. Custom templates are often derived from stock
+        # reMarkable templates and retain names such as "Weekplanner 1" or
+        # "Checklist", which causes duplicate/ambiguous registry entries.
+        #
+        # A local templates.json remains authoritative when one exists.
+        # Otherwise derive a unique human-readable name from the filename.
+        display_name = asset.stem.replace("_", " ").strip()
+
         entry: dict[str, Any] = {
-            "name": template.get("name") or asset.stem.replace("_", " "),
+            "name": display_name,
             "filename": asset.stem,
             "iconCode": DEFAULT_ICON_CODE,
             "categories": categories,
