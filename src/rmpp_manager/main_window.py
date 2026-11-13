@@ -4,7 +4,7 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,8 +29,11 @@ from .device import (
     DeploymentPlan,
     DeploymentSpec,
     DeviceConfig,
+    PermanentTemplate,
+    audit_permanent_templates,
     build_plan,
     deploy,
+    remove_permanent_templates,
     restore_backup,
     test_connection,
 )
@@ -117,6 +120,61 @@ class PlanDialog(QDialog):
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
         layout.addWidget(close_button)
+
+
+class PermanentTemplatesDialog(QDialog):
+    def __init__(
+        self,
+        templates: list[PermanentTemplate],
+        on_remove: Callable[[list[str]], None],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Permanent templates audit")
+        self.resize(620, 480)
+        self.on_remove = on_remove
+        self.checkboxes: list[tuple[str, QCheckBox]] = []
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "These are TemplateType objects stored in the device's permanent "
+            "template store. Tick entries to remove them. Each selected triplet "
+            "will be backed up first."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        if templates:
+            for template in templates:
+                suffix = " (incomplete triplet)" if not template.complete else ""
+                checkbox = QCheckBox(
+                    f"{template.visible_name} — {template.uuid}{suffix}"
+                )
+                checkbox.setToolTip(
+                    "Select this permanent TemplateType for removal."
+                )
+                layout.addWidget(checkbox)
+                self.checkboxes.append((template.uuid, checkbox))
+        else:
+            layout.addWidget(QLabel("No custom permanent TemplateType objects were found."))
+        layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        remove_button = QPushButton("Remove selected…")
+        remove_button.setEnabled(bool(templates))
+        remove_button.clicked.connect(self._remove_selected)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(remove_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def _remove_selected(self) -> None:
+        selected = [uuid for uuid, checkbox in self.checkboxes if checkbox.isChecked()]
+        if selected:
+            self.on_remove(selected)
+            self.accept()
 
 
 class DeployTab(QWidget):
@@ -218,9 +276,12 @@ class DeployTab(QWidget):
         self.push_button.clicked.connect(self.push)
         self.restore_button = QPushButton("Restore backup…")
         self.restore_button.clicked.connect(self.restore)
+        self.audit_button = QPushButton("Audit permanent templates…")
+        self.audit_button.clicked.connect(self.audit_permanent_templates)
         action_row.addWidget(self.preview_button)
         action_row.addWidget(self.push_button)
         action_row.addWidget(self.restore_button)
+        action_row.addWidget(self.audit_button)
         layout.addLayout(action_row)
 
         self.log = QPlainTextEdit()
@@ -316,6 +377,7 @@ class DeployTab(QWidget):
         self.preview_button.setEnabled(not busy)
         self.push_button.setEnabled(not busy)
         self.restore_button.setEnabled(not busy)
+        self.audit_button.setEnabled(not busy)
 
     def _start(
         self,
@@ -390,6 +452,64 @@ class DeployTab(QWidget):
         self._start(
             lambda: build_plan(config, spec),
             success=lambda result: PlanDialog(result, self).exec(),
+        )
+
+    def audit_permanent_templates(self) -> None:
+        config = self._config()
+        self._append_log("Auditing permanent TemplateType objects…")
+        self._start(
+            lambda: audit_permanent_templates(config),
+            success=lambda result: PermanentTemplatesDialog(
+                result,
+                self.remove_permanent_templates,
+                self,
+            ).exec(),
+        )
+
+    def remove_permanent_templates(self, template_uuids: list[str]) -> None:
+        confirm = QMessageBox.warning(
+            self,
+            "Remove permanent templates?",
+            f"This will permanently remove {len(template_uuids)} selected "
+            "TemplateType object(s) from the device after creating a backup. "
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._begin_remove_permanent_templates(template_uuids)
+
+    def _begin_remove_permanent_templates(self, template_uuids: list[str]) -> None:
+        # The audit dialog is opened from the audit worker's success callback,
+        # before that worker thread has fully finished. Wait until the existing
+        # operation has released the worker slot before starting removal.
+        if self.thread is not None:
+            QTimer.singleShot(
+                50,
+                lambda: self._begin_remove_permanent_templates(template_uuids),
+            )
+            return
+
+        config = self._config()
+
+        def work():
+            logger = self.worker.log.emit if self.worker is not None else None
+            return remove_permanent_templates(
+                config,
+                template_uuids,
+                backup_root=self.library_root / "backups",
+                log=logger,
+            )
+
+        self._append_log("Removing selected permanent templates…")
+        self._start(
+            work,
+            success=lambda result: QMessageBox.information(
+                self,
+                "Permanent templates removed",
+                f"Backup saved to:\n{result}",
+            ),
         )
 
     def push(self) -> None:

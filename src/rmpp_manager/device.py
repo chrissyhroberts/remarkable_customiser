@@ -96,6 +96,22 @@ class TemplateDeployment:
         return f"{REMOTE_XOCHITL}/{self.uuid}.content"
 
 
+@dataclass(slots=True)
+class PermanentTemplate:
+    uuid: str
+    visible_name: str
+    metadata: dict[str, Any]
+    complete: bool
+
+    @property
+    def paths(self) -> tuple[str, str, str]:
+        return (
+            f"{REMOTE_XOCHITL}/{self.uuid}.template",
+            f"{REMOTE_XOCHITL}/{self.uuid}.metadata",
+            f"{REMOTE_XOCHITL}/{self.uuid}.content",
+        )
+
+
 def parse_firmware_version(value: str) -> tuple[int, ...]:
     """Extract a comparable numeric firmware version from device text."""
     match = re.search(r"(?m)^VERSION_ID=\"?([0-9]+(?:\.[0-9]+)*)", value)
@@ -353,6 +369,105 @@ def _carousel_files(remote: RemoteSession) -> list[str]:
         for name in remote.listdir(REMOTE_CAROUSEL)
         if name.lower().endswith(".png") and name.startswith("sleep_Illustration_")
     )
+
+
+def audit_permanent_templates(
+    config: DeviceConfig,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> list[PermanentTemplate]:
+    """List custom TemplateType objects in the writable xochitl store."""
+    with RemoteSession(config, log=log, label="template-audit") as remote:
+        version = remote.firmware_version()
+        if not is_template_type_firmware(version):
+            raise DeviceError(
+                "Permanent TemplateType storage is only available on firmware 3.30+."
+            )
+        if not remote.exists(REMOTE_XOCHITL):
+            return []
+
+        results: list[PermanentTemplate] = []
+        for name in sorted(remote.listdir(REMOTE_XOCHITL)):
+            if not name.endswith(".metadata"):
+                continue
+            stem = name[:-len(".metadata")]
+            try:
+                template_uuid = str(uuid.UUID(stem))
+            except ValueError:
+                continue
+            metadata_path = f"{REMOTE_XOCHITL}/{name}"
+            try:
+                metadata = remote.read_json(metadata_path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if metadata.get("type") != "TemplateType":
+                continue
+            template_path, _metadata_path, content_path = PermanentTemplate(
+                template_uuid, "", metadata, False
+            ).paths
+            complete = all(
+                remote.exists(path)
+                for path in (template_path, metadata_path, content_path)
+            )
+            results.append(
+                PermanentTemplate(
+                    uuid=template_uuid,
+                    visible_name=str(metadata.get("visibleName", template_uuid)),
+                    metadata=metadata,
+                    complete=complete,
+                )
+            )
+        return results
+
+
+def remove_permanent_templates(
+    config: DeviceConfig,
+    template_uuids: list[str],
+    *,
+    backup_root: Path,
+    log: Callable[[str], None] | None = None,
+) -> Path:
+    """Back up and remove explicitly selected TemplateType triplets."""
+    if not template_uuids:
+        raise DeviceError("No permanent templates were selected for removal.")
+    normalized: list[str] = []
+    for value in template_uuids:
+        try:
+            normalized.append(str(uuid.UUID(value)))
+        except ValueError as exc:
+            raise DeviceError(f"Invalid permanent template UUID: {value}") from exc
+
+    emit = log or (lambda _message: None)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    backup_dir = backup_root.expanduser() / config.host / "permanent-templates" / stamp
+    current = {item.uuid: item for item in audit_permanent_templates(config, log=emit)}
+    with RemoteSession(config, log=emit, label="template-remove") as remote:
+        # Re-check the selected paths on this write connection before backing up
+        # or deleting anything.
+        selected = [current[value] for value in normalized if value in current]
+        missing = [value for value in normalized if value not in current]
+        if missing:
+            raise DeviceError(
+                "Selected permanent template(s) no longer exist: " + ", ".join(missing)
+            )
+        for item in selected:
+            for remote_path in item.paths:
+                if remote.exists(remote_path):
+                    remote.download(remote_path, backup_dir / remote_path.lstrip("/"))
+        for item in selected:
+            for remote_path in item.paths:
+                remote.exec(f"rm -f {shlex.quote(remote_path)}")
+        for item in selected:
+            leftovers = [path for path in item.paths if remote.exists(path)]
+            if leftovers:
+                raise DeviceError(
+                    "Permanent template removal verification failed: "
+                    + ", ".join(leftovers)
+                )
+        remote.exec("sync", timeout=60.0)
+        remote.exec("systemctl restart xochitl", timeout=60.0)
+    emit(f"Removed {len(selected)} permanent template(s); backup saved to {backup_dir}")
+    return backup_dir
 
 
 def _template_uuid_map_path(folder: Path) -> Path:

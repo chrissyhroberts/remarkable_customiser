@@ -21,6 +21,7 @@ The deployment interface can:
 - blank the current sleep-carousel illustrations;
 - upload custom carousel artwork;
 - upload native `.template` files;
+- audit and explicitly remove permanent 3.30+ `TemplateType` templates;
 - fetch and merge the device's live `templates.json`;
 - preview intended changes before deployment;
 - create timestamped backups of affected files;
@@ -223,6 +224,11 @@ On firmware 3.30 and later, the legacy registry path is retained for backward
 compatibility but custom templates are installed as `TemplateType` triplets in
 the xochitl store described above. The files are checked after upload and
 `xochitl` is restarted after synchronization.
+
+The **Audit permanent templates** action lists the `TemplateType` objects found
+in that store. Removal is opt-in via checkboxes; selected triplets are backed up,
+deleted, verified, and followed by an `xochitl` restart. Unchecked templates are
+left untouched.
 
 ### Registry merge behaviour
 
