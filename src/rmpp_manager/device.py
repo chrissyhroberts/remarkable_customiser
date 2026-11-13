@@ -400,7 +400,10 @@ def audit_permanent_templates(
                 metadata = remote.read_json(metadata_path)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-            if metadata.get("type") != "TemplateType":
+            if (
+                metadata.get("type") != "TemplateType"
+                or metadata.get("source") != "remarkable_customiser"
+            ):
                 continue
             template_path, _metadata_path, content_path = PermanentTemplate(
                 template_uuid, "", metadata, False
@@ -454,18 +457,42 @@ def remove_permanent_templates(
             for remote_path in item.paths:
                 if remote.exists(remote_path):
                     remote.download(remote_path, backup_dir / remote_path.lstrip("/"))
-        for item in selected:
-            for remote_path in item.paths:
-                remote.exec(f"rm -f {shlex.quote(remote_path)}")
-        for item in selected:
-            leftovers = [path for path in item.paths if remote.exists(path)]
-            if leftovers:
+
+        xochitl_stopped = False
+        try:
+            # xochitl can recreate document-store files if they are removed
+            # while it is running. Stop it before deleting, then verify again
+            # after starting it back up.
+            remote.exec("systemctl stop xochitl", timeout=60.0)
+            xochitl_stopped = True
+            for item in selected:
+                for remote_path in item.paths:
+                    remote.exec(f"rm -f {shlex.quote(remote_path)}")
+            for item in selected:
+                leftovers = [path for path in item.paths if remote.exists(path)]
+                if leftovers:
+                    raise DeviceError(
+                        "Permanent template removal verification failed: "
+                        + ", ".join(leftovers)
+                    )
+            remote.exec("sync", timeout=60.0)
+            remote.exec("systemctl start xochitl", timeout=60.0)
+            xochitl_stopped = False
+            remote.exec("sleep 2", timeout=10.0)
+            recreated = [
+                path
+                for item in selected
+                for path in item.paths
+                if remote.exists(path)
+            ]
+            if recreated:
                 raise DeviceError(
-                    "Permanent template removal verification failed: "
-                    + ", ".join(leftovers)
+                    "Permanent template removal failed; xochitl recreated: "
+                    + ", ".join(recreated)
                 )
-        remote.exec("sync", timeout=60.0)
-        remote.exec("systemctl restart xochitl", timeout=60.0)
+        finally:
+            if xochitl_stopped:
+                remote.exec("systemctl start xochitl", check=False, timeout=60.0)
     emit(f"Removed {len(selected)} permanent template(s); backup saved to {backup_dir}")
     return backup_dir
 
