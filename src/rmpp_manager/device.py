@@ -374,6 +374,7 @@ def _carousel_files(remote: RemoteSession) -> list[str]:
 def audit_permanent_templates(
     config: DeviceConfig,
     *,
+    template_folder: Path | None = None,
     log: Callable[[str], None] | None = None,
 ) -> list[PermanentTemplate]:
     """List custom TemplateType objects in the writable xochitl store."""
@@ -386,10 +387,26 @@ def audit_permanent_templates(
         if not remote.exists(REMOTE_XOCHITL):
             return []
 
+        local_names = _local_template_names(template_folder)
+        # Avoid an SFTP round trip for every document in xochitl. The store can
+        # contain many ordinary document metadata files; grep narrows the list
+        # on-device before we read any JSON through SFTP.
+        pattern = r'"type"[[:space:]]*:[[:space:]]*"TemplateType"'
+        _code, candidate_text, _err = remote.exec(
+            "find "
+            f"{shlex.quote(REMOTE_XOCHITL)} "
+            f"-type f -name '*.metadata' -exec grep -lE {shlex.quote(pattern)} {{}} + 2>/dev/null",
+            check=False,
+        )
+        candidate_names = sorted(
+            {
+                posixpath.basename(line.strip())
+                for line in candidate_text.splitlines()
+                if posixpath.basename(line.strip()).endswith(".metadata")
+            }
+        )
         results: list[PermanentTemplate] = []
-        for name in sorted(remote.listdir(REMOTE_XOCHITL)):
-            if not name.endswith(".metadata"):
-                continue
+        for name in candidate_names:
             stem = name[:-len(".metadata")]
             try:
                 template_uuid = str(uuid.UUID(stem))
@@ -415,7 +432,10 @@ def audit_permanent_templates(
             results.append(
                 PermanentTemplate(
                     uuid=template_uuid,
-                    visible_name=str(metadata.get("visibleName", template_uuid)),
+                    visible_name=local_names.get(
+                        template_uuid,
+                        str(metadata.get("visibleName", template_uuid)),
+                    ),
                     metadata=metadata,
                     complete=complete,
                 )
@@ -499,6 +519,27 @@ def remove_permanent_templates(
 
 def _template_uuid_map_path(folder: Path) -> Path:
     return Path(folder) / LOCAL_UUID_MAP
+
+
+def _local_template_names(folder: Path | None) -> dict[str, str]:
+    """Resolve UUIDs to the selected folder's manifest display names."""
+    if folder is None:
+        return {}
+    folder = Path(folder).expanduser()
+    if not folder.is_dir():
+        return {}
+    try:
+        mappings = _load_template_uuid_map(folder)
+        _assets, entries = discover_local_templates(folder)
+    except (OSError, ValueError, json.JSONDecodeError, DeviceError):
+        return {}
+    names: dict[str, str] = {}
+    for entry in entries:
+        key = f"{entry_key(entry)[0]}|{'landscape' if entry_key(entry)[1] else 'portrait'}"
+        template_uuid = mappings.get(key)
+        if template_uuid and str(entry.get("name", "")).strip():
+            names[template_uuid] = str(entry["name"]).strip()
+    return names
 
 
 def _load_template_uuid_map(folder: Path) -> dict[str, str]:

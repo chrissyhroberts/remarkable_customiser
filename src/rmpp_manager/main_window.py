@@ -456,10 +456,19 @@ class DeployTab(QWidget):
 
     def audit_permanent_templates(self) -> None:
         config = self._config()
+        template_folder = (
+            Path(self.template_path.text().strip()).expanduser()
+            if self.template_path.text().strip()
+            else None
+        )
 
         def work():
             logger = self.worker.log.emit if self.worker is not None else None
-            return audit_permanent_templates(config, log=logger)
+            return audit_permanent_templates(
+                config,
+                template_folder=template_folder,
+                log=logger,
+            )
 
         self._append_log("Auditing permanent TemplateType objects…")
         self._start(
