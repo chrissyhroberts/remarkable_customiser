@@ -38,6 +38,7 @@ from .device import (
     test_connection,
 )
 from .editor import TemplateEditor
+from .registry import discover_local_templates
 
 
 class Worker(QObject):
@@ -177,6 +178,57 @@ class PermanentTemplatesDialog(QDialog):
             self.accept()
 
 
+class LocalTemplateSelectionDialog(QDialog):
+    def __init__(
+        self,
+        assets: list[Path],
+        entries: list[dict],
+        selected: set[str] | None,
+        on_selected: Callable[[set[str]], None],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Select templates to deploy")
+        self.resize(620, 480)
+        self.on_selected = on_selected
+        self.checkboxes: list[tuple[str, QCheckBox]] = []
+        names = {
+            str(entry.get("filename", "")).strip(): str(entry.get("name", "")).strip()
+            for entry in entries
+        }
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Choose which local templates may be deployed. Unchecked templates "
+            "will be left untouched on the device."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        for asset in assets:
+            checkbox = QCheckBox(
+                f"{names.get(asset.stem, asset.stem)} — {asset.name}"
+            )
+            checkbox.setChecked(selected is None or asset.name in selected)
+            layout.addWidget(checkbox)
+            self.checkboxes.append((asset.name, checkbox))
+        layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        apply_button = QPushButton("Use selected")
+        apply_button.clicked.connect(self._apply)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(apply_button)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_button)
+        layout.addLayout(buttons)
+
+    def _apply(self) -> None:
+        self.on_selected({name for name, checkbox in self.checkboxes if checkbox.isChecked()})
+        self.accept()
+
+
 class DeployTab(QWidget):
     def __init__(self, settings: QSettings, library_root: Path, parent: QWidget | None = None):
         super().__init__(parent)
@@ -184,6 +236,7 @@ class DeployTab(QWidget):
         self.library_root = library_root
         self.thread: QThread | None = None
         self.worker: Worker | None = None
+        self.selected_template_files: set[str] | None = None
 
         # Success callbacks must only execute on this QWidget's GUI thread.
         # Connecting a worker signal directly to a Python lambda caused Qt
@@ -261,6 +314,9 @@ class DeployTab(QWidget):
         template_browse = QPushButton("Choose folder…")
         template_browse.clicked.connect(self._browse_templates)
         template_row.addWidget(template_browse)
+        self.template_select = QPushButton("Select templates…")
+        self.template_select.clicked.connect(self._select_templates)
+        template_row.addWidget(self.template_select)
         self.replace_conflicts = QCheckBox("Replace registry entries with same filename + orientation")
         self.replace_conflicts.setToolTip(
             "Off is safer: conflicting entries in the live device templates.json are preserved."
@@ -330,9 +386,38 @@ class DeployTab(QWidget):
         )
         if path:
             self.template_path.setText(path)
+            self.selected_template_files = None
+
+    def _select_templates(self) -> None:
+        folder_text = self.template_path.text().strip()
+        if not folder_text:
+            QMessageBox.information(self, "Choose a template folder", "Choose a native template folder first.")
+            return
+        folder = Path(folder_text).expanduser()
+        try:
+            assets, entries = discover_local_templates(folder)
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not read templates", str(exc))
+            return
+        if not assets:
+            QMessageBox.information(self, "No templates", "The selected folder contains no .template files.")
+            return
+        LocalTemplateSelectionDialog(
+            assets,
+            entries,
+            self.selected_template_files,
+            self._set_selected_template_files,
+            self,
+        ).exec()
+
+    def _set_selected_template_files(self, selected: set[str]) -> None:
+        self.selected_template_files = selected
+        self.template_select.setText(f"Select templates… ({len(selected)})")
 
     def set_template_folder(self, path: str) -> None:
         self.template_path.setText(path)
+        self.selected_template_files = None
+        self.template_select.setText("Select templates…")
 
     def _config(self) -> DeviceConfig:
         return DeviceConfig(
@@ -369,6 +454,11 @@ class DeployTab(QWidget):
             carousel_mode=carousel_mode,
             carousel_folder=carousel_folder,
             template_folder=template_folder,
+            template_files=(
+                sorted(self.selected_template_files)
+                if self.selected_template_files is not None
+                else None
+            ),
             replace_registry_conflicts=self.replace_conflicts.isChecked(),
             backup_root=self.library_root / "backups",
         )

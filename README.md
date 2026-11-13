@@ -225,10 +225,12 @@ compatibility but custom templates are installed as `TemplateType` triplets in
 the xochitl store described above. The files are checked after upload and
 `xochitl` is restarted after synchronization.
 
-The **Audit permanent templates** action lists the `TemplateType` objects found
-in that store. Removal is opt-in via checkboxes; selected triplets are backed up,
-deleted, verified, and followed by an `xochitl` restart. Unchecked templates are
-left untouched.
+The **Audit permanent templates** action lists the `.template` files found in
+that store. Removal is opt-in via checkboxes; selected triplets are backed up,
+deleted, and verified. Unchecked templates are left untouched. The removal
+operation then restarts `xochitl` and verifies that the deleted files were not
+recreated. A UUID tombstone is written so cloud synchronization does not restore
+the deleted template.
 
 ### Registry merge behaviour
 

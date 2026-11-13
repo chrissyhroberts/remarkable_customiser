@@ -52,6 +52,7 @@ class DeploymentSpec:
     carousel_mode: str = "blank"  # leave | blank | custom
     carousel_folder: Path | None = None
     template_folder: Path | None = None
+    template_files: list[str] | None = None
     replace_registry_conflicts: bool = False
     backup_root: Path = Path.home() / "Documents" / "reMarkable Templates" / "backups"
 
@@ -82,6 +83,7 @@ class TemplateDeployment:
     asset: Path
     entry: dict[str, Any]
     uuid: str
+    upload_template: bool = True
 
     @property
     def template_path(self) -> str:
@@ -111,6 +113,10 @@ class PermanentTemplate:
             f"{REMOTE_XOCHITL}/{self.uuid}.content",
         )
 
+    @property
+    def tombstone_path(self) -> str:
+        return f"{REMOTE_XOCHITL}/{self.uuid}.tombstone"
+
 
 def parse_firmware_version(value: str) -> tuple[int, ...]:
     """Extract a comparable numeric firmware version from device text."""
@@ -124,6 +130,15 @@ def parse_firmware_version(value: str) -> tuple[int, ...]:
 
 def is_template_type_firmware(version: tuple[int, ...]) -> bool:
     return version >= (3, 30)
+
+
+def _version_tuple(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    match = re.search(r"[0-9]+(?:\.[0-9]+)*", str(value))
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(0).split("."))
 
 
 class RemoteSession:
@@ -453,55 +468,64 @@ def remove_permanent_templates(
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     backup_dir = backup_root.expanduser() / config.host / "permanent-templates" / stamp
     current = {item.uuid: item for item in audit_permanent_templates(config, log=emit)}
-    with RemoteSession(config, log=emit, label="template-remove") as remote:
-        # Re-check the selected paths on this write connection before backing up
-        # or deleting anything.
-        selected = [current[value] for value in normalized if value in current]
-        missing = [value for value in normalized if value not in current]
-        if missing:
-            raise DeviceError(
-                "Selected permanent template(s) no longer exist: " + ", ".join(missing)
-            )
+    selected = [current[value] for value in normalized if value in current]
+    missing = [value for value in normalized if value not in current]
+    if missing:
+        raise DeviceError(
+            "Selected permanent template(s) no longer exist: " + ", ".join(missing)
+        )
+
+    # Keep each lifecycle transition on its own SSH connection. Stopping or
+    # restarting xochitl can disturb the device's services and invalidate an
+    # otherwise healthy Paramiko transport.
+    with RemoteSession(config, log=emit, label="template-backup") as remote:
         for item in selected:
             for remote_path in item.paths:
                 if remote.exists(remote_path):
                     remote.download(remote_path, backup_dir / remote_path.lstrip("/"))
 
-        xochitl_stopped = False
-        try:
-            # xochitl can recreate document-store files if they are removed
-            # while it is running. Stop it before deleting, then verify again
-            # after starting it back up.
-            remote.exec("systemctl stop xochitl", timeout=60.0)
-            xochitl_stopped = True
+    with RemoteSession(config, log=emit, label="template-stop") as remote:
+        remote.exec("systemctl stop xochitl", timeout=60.0)
+
+    try:
+        with RemoteSession(config, log=emit, label="template-delete") as remote:
+            # The tombstone prevents cloud sync from restoring a deleted UUID.
             for item in selected:
                 for remote_path in item.paths:
+                    emit(f"Removing {remote_path}")
                     remote.exec(f"rm -f {shlex.quote(remote_path)}")
-            for item in selected:
-                leftovers = [path for path in item.paths if remote.exists(path)]
-                if leftovers:
-                    raise DeviceError(
-                        "Permanent template removal verification failed: "
-                        + ", ".join(leftovers)
-                    )
+                tombstone = datetime.now().strftime("%a %b %d %H:%M:%S %Y").encode("ascii") + b"\n"
+                emit(f"Writing deletion tombstone {item.tombstone_path}")
+                remote.upload_bytes_atomic(tombstone, item.tombstone_path)
             remote.exec("sync", timeout=60.0)
-            remote.exec("systemctl start xochitl", timeout=60.0)
-            xochitl_stopped = False
-            remote.exec("sleep 2", timeout=10.0)
-            recreated = [
+            leftovers = [
                 path
                 for item in selected
                 for path in item.paths
                 if remote.exists(path)
             ]
-            if recreated:
+            if leftovers:
                 raise DeviceError(
-                    "Permanent template removal failed; xochitl recreated: "
-                    + ", ".join(recreated)
+                    "Permanent template removal verification failed: "
+                    + ", ".join(leftovers)
                 )
-        finally:
-            if xochitl_stopped:
-                remote.exec("systemctl start xochitl", check=False, timeout=60.0)
+    finally:
+        with RemoteSession(config, log=emit, label="template-restart") as remote:
+            remote.exec("systemctl restart xochitl", check=False, timeout=60.0)
+
+    with RemoteSession(config, log=emit, label="template-verify") as remote:
+        remote.exec("sleep 2", timeout=10.0)
+        recreated = [
+            path
+            for item in selected
+            for path in item.paths
+            if remote.exists(path)
+        ]
+        if recreated:
+            raise DeviceError(
+                "Permanent template removal failed; xochitl recreated: "
+                + ", ".join(recreated)
+            )
     emit(f"Removed {len(selected)} permanent template(s); backup saved to {backup_dir}")
     return backup_dir
 
@@ -606,8 +630,75 @@ def _template_metadata(entry: dict[str, Any]) -> bytes:
         "source": "remarkable_customiser",
         "type": "TemplateType",
         "visibleName": str(entry.get("name", entry.get("filename", "Custom template"))),
+        "filename": str(entry.get("filename", "")),
     }
     return (json.dumps(metadata, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _reconcile_template_deployments(
+    remote: RemoteSession,
+    folder: Path,
+    deployments: list[TemplateDeployment],
+) -> None:
+    """Reuse existing UUIDs and skip native uploads with matching versions."""
+    filenames = set(remote.listdir(REMOTE_XOCHITL)) if remote.exists(REMOTE_XOCHITL) else set()
+    existing: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for name in filenames:
+        if not name.endswith(".template"):
+            continue
+        stem = name[:-len(".template")]
+        try:
+            template_uuid = str(uuid.UUID(stem))
+        except ValueError:
+            continue
+        metadata: dict[str, Any] = {}
+        template: dict[str, Any] = {}
+        metadata_name = f"{stem}.metadata"
+        if metadata_name in filenames:
+            try:
+                metadata = remote.read_json(f"{REMOTE_XOCHITL}/{metadata_name}")
+            except (OSError, ValueError, json.JSONDecodeError):
+                metadata = {}
+        try:
+            template = remote.read_json(f"{REMOTE_XOCHITL}/{name}")
+        except (OSError, ValueError, json.JSONDecodeError):
+            template = {}
+        existing.append((template_uuid, metadata, template))
+
+    mappings = _load_template_uuid_map(folder)
+    mappings_changed = False
+    for deployment in deployments:
+        local_template = json.loads(deployment.asset.read_text(encoding="utf-8"))
+        local_version = _version_tuple(local_template.get("templateVersion"))
+        candidates = [
+            item for item in existing
+            if item[0] == deployment.uuid
+            or (
+                item[1].get("filename") == deployment.entry.get("filename")
+                and item[1].get("source") == "remarkable_customiser"
+            )
+            or (
+                item[1].get("visibleName") == deployment.entry.get("name")
+                and item[1].get("source") == "remarkable_customiser"
+            )
+        ]
+        if candidates:
+            same_version = next(
+                (
+                    item for item in candidates
+                    if _version_tuple(item[2].get("templateVersion")) == local_version
+                ),
+                candidates[0],
+            )
+            deployment.uuid = same_version[0]
+            key = f"{entry_key(deployment.entry)[0]}|{'landscape' if entry_key(deployment.entry)[1] else 'portrait'}"
+            if mappings.get(key) != deployment.uuid:
+                mappings[key] = deployment.uuid
+                mappings_changed = True
+            remote_version = _version_tuple(same_version[2].get("templateVersion"))
+            deployment.upload_template = remote_version != local_version
+    if mappings_changed:
+        _save_template_uuid_map(folder, mappings)
 
 
 def build_plan(
@@ -661,6 +752,14 @@ def build_plan(
                 spec.template_folder
             )
 
+            if spec.template_files is not None:
+                selected_files = set(spec.template_files)
+                assets = [asset for asset in assets if asset.name in selected_files]
+                entries = [
+                    entry for entry in entries
+                    if f"{entry.get('filename', '').strip()}.template" in selected_files
+                ]
+
             plan.template_assets = assets
             plan.template_entries = entries
 
@@ -672,6 +771,11 @@ def build_plan(
                 if modern_templates:
                     plan.template_deployments = _template_deployments(
                         Path(spec.template_folder), assets, entries
+                    )
+                    _reconcile_template_deployments(
+                        remote,
+                        Path(spec.template_folder),
+                        plan.template_deployments,
                     )
                     plan.actions.append(
                         f"Deploy {len(assets)} TemplateType template triplet(s)"
@@ -928,7 +1032,13 @@ def deploy(
                         f"Uploading TemplateType {deployment.entry.get('name')} "
                         f"({deployment.uuid})"
                     )
-                    remote.upload_atomic(deployment.asset, deployment.template_path)
+                    if deployment.upload_template:
+                        remote.upload_atomic(deployment.asset, deployment.template_path)
+                    else:
+                        emit(
+                            f"Skipping {deployment.asset.name}: "
+                            "matching templateVersion already exists"
+                        )
                     remote.upload_bytes_atomic(
                         _template_metadata(deployment.entry),
                         deployment.metadata_path,
