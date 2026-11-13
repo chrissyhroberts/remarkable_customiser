@@ -388,45 +388,34 @@ def audit_permanent_templates(
             return []
 
         local_names = _local_template_names(template_folder)
-        # Avoid an SFTP round trip for every document in xochitl. The store can
-        # contain many ordinary document metadata files; grep narrows the list
-        # on-device before we read any JSON through SFTP.
-        pattern = r'"type"[[:space:]]*:[[:space:]]*"TemplateType"'
-        _code, candidate_text, _err = remote.exec(
-            "find "
-            f"{shlex.quote(REMOTE_XOCHITL)} "
-            f"-type f -name '*.metadata' -exec grep -lE {shlex.quote(pattern)} {{}} + 2>/dev/null",
-            check=False,
-        )
+        # The directory's .template filenames are the source of truth. Do not
+        # depend on metadata formatting or a particular type/source field to
+        # discover entries; older custom objects may not contain those fields.
+        filenames = set(remote.listdir(REMOTE_XOCHITL))
         candidate_names = sorted(
-            {
-                posixpath.basename(line.strip())
-                for line in candidate_text.splitlines()
-                if posixpath.basename(line.strip()).endswith(".metadata")
-            }
+            name
+            for name in filenames
+            if name.endswith(".template")
         )
         results: list[PermanentTemplate] = []
         for name in candidate_names:
-            stem = name[:-len(".metadata")]
+            stem = name[:-len(".template")]
             try:
                 template_uuid = str(uuid.UUID(stem))
             except ValueError:
                 continue
-            metadata_path = f"{REMOTE_XOCHITL}/{name}"
+            metadata_path = f"{REMOTE_XOCHITL}/{stem}.metadata"
+            metadata: dict[str, Any] = {}
             try:
-                metadata = remote.read_json(metadata_path)
+                if f"{stem}.metadata" in filenames:
+                    metadata = remote.read_json(metadata_path)
             except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if (
-                metadata.get("type") != "TemplateType"
-                or metadata.get("source") != "remarkable_customiser"
-            ):
-                continue
+                metadata = {}
             template_path, _metadata_path, content_path = PermanentTemplate(
                 template_uuid, "", metadata, False
             ).paths
             complete = all(
-                remote.exists(path)
+                posixpath.basename(path) in filenames
                 for path in (template_path, metadata_path, content_path)
             )
             results.append(
@@ -434,7 +423,7 @@ def audit_permanent_templates(
                     uuid=template_uuid,
                     visible_name=local_names.get(
                         template_uuid,
-                        str(metadata.get("visibleName", template_uuid)),
+                        str(metadata.get("visibleName", stem)),
                     ),
                     metadata=metadata,
                     complete=complete,

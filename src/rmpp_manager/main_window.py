@@ -137,7 +137,7 @@ class PermanentTemplatesDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "These are TemplateType objects stored in the device's permanent "
+            "These are UUID-named .template files found in the device's permanent "
             "template store. Tick entries to remove them. Each selected triplet "
             "will be backed up first."
         )
@@ -148,7 +148,7 @@ class PermanentTemplatesDialog(QDialog):
             for template in templates:
                 suffix = " (incomplete triplet)" if not template.complete else ""
                 checkbox = QCheckBox(
-                    f"{template.visible_name} — {template.uuid}{suffix}"
+                    f"{template.visible_name} — {template.uuid}.template{suffix}"
                 )
                 checkbox.setToolTip(
                     "Select this permanent TemplateType for removal."
