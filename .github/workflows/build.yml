@@ -3,11 +3,9 @@ name: Build desktop apps
 on:
   workflow_dispatch:
 
+  # Build every branch push, including version-tag pushes. Tagged pushes also
+  # publish a GitHub release after both desktop artifacts succeed.
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
 
   pull_request:
     branches:

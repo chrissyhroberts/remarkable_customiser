@@ -130,7 +130,7 @@ Change the IP address in the GUI if your reMarkable uses a different address.
 
 The reMarkable root filesystem is normally mounted read-only. Deployment therefore uses deliberately separate SSH connections for the different stages of the operation.
 
-The workflow is:
+For firmware before 3.30, the workflow is:
 
 ```text
 1. Connect and inspect the device
@@ -162,6 +162,23 @@ The deployment log records connection phases, root mount state, write-access che
 
 This is deliberately verbose so failures on different reMarkable firmware versions can be diagnosed.
 
+On firmware 3.30 and later, custom templates use the writable xochitl document
+store instead of modifying the root filesystem. Each selected template is
+deployed as a stable-UUID triplet under
+`/home/root/.local/share/remarkable/xochitl`:
+
+```text
+<uuid>.template
+<uuid>.metadata
+<uuid>.content
+```
+
+The UUID mapping is kept in `.rmpp-template-uuids.json` beside the selected
+local templates, so redeploying a template updates the existing TemplateType
+instead of creating a duplicate. Template metadata comes from the selected
+folder's `templates.json`; no `iconData` is generated yet. Template-only
+deployments on 3.30+ do not remount `/`.
+
 ## Suspend screen
 
 Select any PNG in the GUI.
@@ -188,7 +205,7 @@ Rather than assuming a fixed image size, it creates blank replacements using the
 
 ## Templates
 
-Native template files are installed under:
+On firmware before 3.30, native template files are installed under:
 
 ```text
 /usr/share/remarkable/templates
@@ -201,6 +218,11 @@ The registry is:
 ```
 
 The application fetches the **live** registry from the device before deployment. It does not overwrite it with a bundled copy.
+
+On firmware 3.30 and later, the legacy registry path is retained for backward
+compatibility but custom templates are installed as `TemplateType` triplets in
+the xochitl store described above. The files are checked after upload and
+`xochitl` is restarted after synchronization.
 
 ### Registry merge behaviour
 

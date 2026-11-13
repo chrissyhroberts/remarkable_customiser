@@ -4,11 +4,13 @@ import io
 import json
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import socket
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,8 @@ from .registry import (
 REMOTE_ROOT = "/usr/share/remarkable"
 REMOTE_TEMPLATES = f"{REMOTE_ROOT}/templates"
 REMOTE_REGISTRY = f"{REMOTE_TEMPLATES}/templates.json"
+REMOTE_XOCHITL = "/home/root/.local/share/remarkable/xochitl"
+LOCAL_UUID_MAP = ".rmpp-template-uuids.json"
 REMOTE_SUSPENDED = f"{REMOTE_ROOT}/suspended.png"
 REMOTE_CAROUSEL = f"{REMOTE_ROOT}/carousel"
 
@@ -59,6 +63,10 @@ class DeploymentPlan:
     registry_merge: RegistryMerge | None
     template_entries: list[dict[str, Any]] = field(default_factory=list)
     template_assets: list[Path] = field(default_factory=list)
+    template_deployments: list["TemplateDeployment"] = field(default_factory=list)
+    firmware_version: tuple[int, ...] = (0,)
+    template_mode: str = "legacy"
+    requires_root_remount: bool = False
     carousel_remote_files: list[str] = field(default_factory=list)
     carousel_custom_files: list[Path] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
@@ -67,6 +75,39 @@ class DeploymentPlan:
 
 class DeviceError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class TemplateDeployment:
+    asset: Path
+    entry: dict[str, Any]
+    uuid: str
+
+    @property
+    def template_path(self) -> str:
+        return f"{REMOTE_XOCHITL}/{self.uuid}.template"
+
+    @property
+    def metadata_path(self) -> str:
+        return f"{REMOTE_XOCHITL}/{self.uuid}.metadata"
+
+    @property
+    def content_path(self) -> str:
+        return f"{REMOTE_XOCHITL}/{self.uuid}.content"
+
+
+def parse_firmware_version(value: str) -> tuple[int, ...]:
+    """Extract a comparable numeric firmware version from device text."""
+    match = re.search(r"(?m)^VERSION_ID=\"?([0-9]+(?:\.[0-9]+)*)", value)
+    if match is None:
+        match = re.search(r"(?<![0-9])([0-9]+\.[0-9]+(?:\.[0-9]+)*)", value)
+    if match is None:
+        raise DeviceError("Could not determine the reMarkable firmware version.")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def is_template_type_firmware(version: tuple[int, ...]) -> bool:
+    return version >= (3, 30)
 
 
 class RemoteSession:
@@ -190,6 +231,15 @@ class RemoteSession:
         self._debug(f"MOUNT {state}")
         return state
 
+    def firmware_version(self) -> tuple[int, ...]:
+        _code, output, _err = self.exec(
+            "cat /etc/os-release 2>/dev/null; cat /etc/version 2>/dev/null",
+            check=False,
+        )
+        version = parse_firmware_version(output)
+        self._debug(f"FIRMWARE {'.'.join(str(part) for part in version)}")
+        return version
+
     def verify_write_access(self) -> None:
         marker = shlex.quote(f"{REMOTE_ROOT}/.rmpp-manager-write-test")
         self._debug("WRITE TEST in /usr/share/remarkable")
@@ -305,6 +355,89 @@ def _carousel_files(remote: RemoteSession) -> list[str]:
     )
 
 
+def _template_uuid_map_path(folder: Path) -> Path:
+    return Path(folder) / LOCAL_UUID_MAP
+
+
+def _load_template_uuid_map(folder: Path) -> dict[str, str]:
+    path = _template_uuid_map_path(folder)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeviceError(f"Could not read template UUID mapping {path}: {exc}") from exc
+    mappings = data.get("templates", data)
+    if not isinstance(mappings, dict):
+        raise DeviceError(f"Template UUID mapping {path} is not an object.")
+    result: dict[str, str] = {}
+    for key, value in mappings.items():
+        try:
+            result[str(key)] = str(uuid.UUID(str(value)))
+        except ValueError as exc:
+            raise DeviceError(f"Invalid UUID mapping for {key!r} in {path}") from exc
+    return result
+
+
+def _save_template_uuid_map(folder: Path, mappings: dict[str, str]) -> None:
+    path = _template_uuid_map_path(folder)
+    payload = {"version": 1, "templates": dict(sorted(mappings.items()))}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _template_deployments(
+    folder: Path,
+    assets: list[Path],
+    entries: list[dict[str, Any]],
+) -> list[TemplateDeployment]:
+    """Pair local native files with manifest metadata and stable UUIDs."""
+    mappings = _load_template_uuid_map(folder)
+    changed = False
+    deployments: list[TemplateDeployment] = []
+    for asset in assets:
+        matching = [
+            entry for entry in entries
+            if str(entry.get("filename", "")).strip() == asset.stem
+            and bool(entry.get("landscape", False)) == _template_is_landscape(asset)
+        ]
+        if not matching:
+            raise DeviceError(f"No registry metadata found for {asset.name}")
+        entry = matching[0]
+        key = f"{entry_key(entry)[0]}|{'landscape' if entry_key(entry)[1] else 'portrait'}"
+        template_uuid = mappings.get(key)
+        if template_uuid is None:
+            template_uuid = str(uuid.uuid4())
+            mappings[key] = template_uuid
+            changed = True
+        deployments.append(TemplateDeployment(asset=asset, entry=entry, uuid=template_uuid))
+    if changed:
+        _save_template_uuid_map(folder, mappings)
+    return deployments
+
+
+def _template_is_landscape(asset: Path) -> bool:
+    try:
+        template = json.loads(asset.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeviceError(f"Could not read template {asset}: {exc}") from exc
+    return str(template.get("orientation", "portrait")).lower() == "landscape"
+
+
+def _template_metadata(entry: dict[str, Any]) -> bytes:
+    now = str(int(time.time() * 1000))
+    metadata = {
+        "createdTime": now,
+        "lastModified": now,
+        "new": True,
+        "parent": "",
+        "pinned": False,
+        "source": "remarkable_customiser",
+        "type": "TemplateType",
+        "visibleName": str(entry.get("name", entry.get("filename", "Custom template"))),
+    }
+    return (json.dumps(metadata, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 def build_plan(
     config: DeviceConfig,
     spec: DeploymentSpec,
@@ -312,10 +445,21 @@ def build_plan(
     log: Callable[[str], None] | None = None,
 ) -> DeploymentPlan:
     with RemoteSession(config, log=log, label='plan') as remote:
-        if not remote.exists(REMOTE_REGISTRY):
+        firmware_version = remote.firmware_version()
+        modern_templates = is_template_type_firmware(firmware_version)
+        if remote.exists(REMOTE_REGISTRY):
+            registry = remote.read_json(REMOTE_REGISTRY)
+        elif not modern_templates and spec.template_folder is not None:
             raise DeviceError(f"Template registry not found: {REMOTE_REGISTRY}")
-        registry = remote.read_json(REMOTE_REGISTRY)
-        plan = DeploymentPlan(remote_registry=registry, merged_registry=registry, registry_merge=None)
+        else:
+            registry = {"templates": []}
+        plan = DeploymentPlan(
+            remote_registry=registry,
+            merged_registry=registry,
+            registry_merge=None,
+            firmware_version=firmware_version,
+            template_mode="template_type" if modern_templates else "legacy",
+        )
 
         if spec.suspend_screen is not None:
             if not spec.suspend_screen.is_file():
@@ -353,43 +497,56 @@ def build_plan(
                     "The selected template folder contains no .template files."
                 )
             else:
-                merge = merge_registry(
-                    registry,
-                    entries,
-                    replace_conflicts=True,
-                )
+                if modern_templates:
+                    plan.template_deployments = _template_deployments(
+                        Path(spec.template_folder), assets, entries
+                    )
+                    plan.actions.append(
+                        f"Deploy {len(assets)} TemplateType template triplet(s)"
+                    )
+                else:
+                    merge = merge_registry(
+                        registry,
+                        entries,
+                        replace_conflicts=True,
+                    )
 
-                plan.registry_merge = merge
-                plan.merged_registry = merge.merged
+                    plan.registry_merge = merge
+                    plan.merged_registry = merge.merged
 
                 plan.actions.append(
                     f"Upload {len(assets)} native template file(s)"
                 )
-                plan.actions.append(
-                    f"Add {len(merge.added)} custom registry entries"
-                )
-
-                if merge.updated:
+                if not modern_templates:
                     plan.actions.append(
-                        f"Update {len(merge.updated)} existing registry entries"
+                        f"Add {len(merge.added)} custom registry entries"
                     )
+                    if merge.updated:
+                        plan.actions.append(
+                            f"Update {len(merge.updated)} existing registry entries"
+                        )
 
-                if merge.unchanged:
+                    if merge.unchanged:
+                        plan.actions.append(
+                            f"Leave {len(merge.unchanged)} identical registry "
+                            "entries unchanged"
+                        )
+
                     plan.actions.append(
-                        f"Leave {len(merge.unchanged)} identical registry "
-                        "entries unchanged"
+                        f"Verify {len(entries)} custom registry entries after upload"
                     )
 
-                plan.actions.append(
-                    f"Verify {len(entries)} custom registry entries "
-                    "after upload"
-                )
+                    if merge.name_collisions:
+                        plan.warnings.append(
+                            f"{len(merge.name_collisions)} display-name "
+                            "collision(s) use different filenames/orientations."
+                        )
 
-                if merge.name_collisions:
-                    plan.warnings.append(
-                        f"{len(merge.name_collisions)} display-name "
-                        "collision(s) use different filenames/orientations."
-                    )
+        plan.requires_root_remount = bool(
+            spec.suspend_screen is not None
+            or spec.carousel_mode in {"blank", "custom"} and bool(plan.carousel_remote_files or plan.carousel_custom_files)
+            or bool(plan.template_assets) and not modern_templates
+        )
 
         if not plan.actions:
             plan.warnings.append("Nothing is selected for deployment.")
@@ -473,6 +630,38 @@ def _verify_registry_entries(
         )
 
 
+def _verify_template_deployments(
+    remote: RemoteSession,
+    deployments: list[TemplateDeployment],
+) -> None:
+    failures: list[str] = []
+    for deployment in deployments:
+        for path in (
+            deployment.template_path,
+            deployment.metadata_path,
+            deployment.content_path,
+        ):
+            code, output, _err = remote.exec(
+                f"test -f {shlex.quote(path)} && wc -c < {shlex.quote(path)}",
+                check=False,
+            )
+            if code != 0:
+                failures.append(f"{path}: missing after upload")
+                continue
+            try:
+                size = int(output.strip())
+            except ValueError:
+                failures.append(f"{path}: could not read uploaded file size")
+                continue
+            if size <= 0:
+                failures.append(f"{path}: uploaded file is empty")
+    if failures:
+        raise DeviceError(
+            "TemplateType verification failed after upload:\n  - "
+            + "\n  - ".join(failures)
+        )
+
+
 
 def deploy(
     config: DeviceConfig,
@@ -500,35 +689,46 @@ def deploy(
     emit("PHASE 2/5 backup on read connection")
     with RemoteSession(config, log=emit, label="backup") as remote:
         remote.mount_state()
-        _backup_one(remote, REMOTE_REGISTRY, backup_dir)
+        if plan.registry_merge is not None:
+            _backup_one(remote, REMOTE_REGISTRY, backup_dir)
         if spec.suspend_screen is not None:
             _backup_one(remote, REMOTE_SUSPENDED, backup_dir)
         for name in plan.carousel_remote_files:
             _backup_one(remote, posixpath.join(REMOTE_CAROUSEL, name), backup_dir)
         for asset in plan.carousel_custom_files:
             _backup_one(remote, posixpath.join(REMOTE_CAROUSEL, asset.name), backup_dir)
-        for asset in plan.template_assets:
-            _backup_one(remote, posixpath.join(REMOTE_TEMPLATES, asset.name), backup_dir)
+        if plan.template_mode == "legacy":
+            for asset in plan.template_assets:
+                _backup_one(remote, posixpath.join(REMOTE_TEMPLATES, asset.name), backup_dir)
+        else:
+            for deployment in plan.template_deployments:
+                _backup_one(remote, deployment.template_path, backup_dir)
+                _backup_one(remote, deployment.metadata_path, backup_dir)
+                _backup_one(remote, deployment.content_path, backup_dir)
     emit(f"Backup saved to {backup_dir}")
     emit("Backup connection CLOSED")
 
-    emit("PHASE 3/5 NEW connection: remount RW")
-    with RemoteSession(config, log=emit, label="remount-rw") as remote:
-        emit("Before remount:")
-        remote.mount_state()
-        remote.exec("mount -o remount,rw /")
-        emit("After remount:")
-        remote.mount_state()
-        remote.verify_write_access()
-    emit("RW-remount connection CLOSED")
+    if plan.requires_root_remount:
+        emit("PHASE 3/5 NEW connection: remount RW")
+        with RemoteSession(config, log=emit, label="remount-rw") as remote:
+            emit("Before remount:")
+            remote.mount_state()
+            remote.exec("mount -o remount,rw /")
+            emit("After remount:")
+            remote.mount_state()
+            remote.verify_write_access()
+        emit("RW-remount connection CLOSED")
+    else:
+        emit("PHASE 3/5 skipped: TemplateType deployment uses writable /home")
 
     upload_succeeded = False
     cleanup_error: Exception | None = None
     try:
-        emit("PHASE 4/5 BRAND-NEW connection after remount: uploads")
+        emit("PHASE 4/5 BRAND-NEW connection: uploads")
         with RemoteSession(config, log=emit, label="upload") as remote:
-            remote.mount_state()
-            remote.verify_write_access()
+            if plan.requires_root_remount:
+                remote.mount_state()
+                remote.verify_write_access()
 
             if spec.suspend_screen is not None:
                 emit(f"Uploading suspended.png from {spec.suspend_screen}")
@@ -545,78 +745,51 @@ def deploy(
                     emit(f"Uploading carousel {asset.name}")
                     remote.upload_atomic(asset, posixpath.join(REMOTE_CAROUSEL, asset.name))
 
-            for asset in plan.template_assets:
-                emit(f"Uploading template {asset.name}")
-                remote.upload_atomic(asset, posixpath.join(REMOTE_TEMPLATES, asset.name))
-
-            if plan.registry_merge is not None:
-                emit(
-                    "Registry merge: "
-                    f"added={len(plan.registry_merge.added)}, "
-                    f"updated={len(plan.registry_merge.updated)}, "
-                    f"unchanged={len(plan.registry_merge.unchanged)}, "
-                    f"final={len(plan.merged_registry.get('templates', []))}"
-                )
-
-                for entry in plan.template_entries:
+            if plan.template_mode == "legacy":
+                for asset in plan.template_assets:
+                    emit(f"Uploading template {asset.name}")
+                    remote.upload_atomic(asset, posixpath.join(REMOTE_TEMPLATES, asset.name))
+            else:
+                remote.exec(f"mkdir -p {shlex.quote(REMOTE_XOCHITL)}")
+                for deployment in plan.template_deployments:
                     emit(
-                        "Manifest entry: "
-                        f"{entry.get('name')} -> "
-                        f"{entry.get('filename')}"
-                        + (
-                            " [landscape]"
-                            if entry.get("landscape")
-                            else ""
-                        )
+                        f"Uploading TemplateType {deployment.entry.get('name')} "
+                        f"({deployment.uuid})"
+                    )
+                    remote.upload_atomic(deployment.asset, deployment.template_path)
+                    remote.upload_bytes_atomic(
+                        _template_metadata(deployment.entry),
+                        deployment.metadata_path,
+                    )
+                    remote.upload_bytes_atomic(b"{}\n", deployment.content_path)
+
+            if plan.template_assets:
+                if plan.template_mode == "legacy":
+                    emit(
+                        "Registry merge: "
+                        f"added={len(plan.registry_merge.added)}, "
+                        f"updated={len(plan.registry_merge.updated)}, "
+                        f"unchanged={len(plan.registry_merge.unchanged)}, "
+                        f"final={len(plan.merged_registry.get('templates', []))}"
                     )
 
-                emit("Uploading merged templates.json")
-
-                payload = (
-                    json.dumps(
-                        plan.merged_registry,
-                        ensure_ascii=False,
-                        indent=2,
+                    emit("Uploading merged templates.json")
+                    payload = (
+                        json.dumps(plan.merged_registry, ensure_ascii=False, indent=2) + "\n"
+                    ).encode("utf-8")
+                    remote.upload_bytes_atomic(payload, REMOTE_REGISTRY)
+                    live_registry = remote.read_json(REMOTE_REGISTRY)
+                    _verify_registry_entries(live_registry, plan.template_entries)
+                    emit(
+                        "Registry verification PASSED: "
+                        f"{len(plan.template_entries)}/{len(plan.template_entries)} custom entries present"
                     )
-                    + "\n"
-                ).encode("utf-8")
-
-                remote.upload_bytes_atomic(
-                    payload,
-                    REMOTE_REGISTRY,
-                )
-
-                emit(
-                    "Reading templates.json back from device "
-                    "for verification"
-                )
-
-                _code, registry_text, _err = remote.exec(
-                    f"cat {shlex.quote(REMOTE_REGISTRY)}",
-                    timeout=30.0,
-                )
-
-                try:
-                    live_registry = json.loads(
-                        registry_text
+                else:
+                    _verify_template_deployments(remote, plan.template_deployments)
+                    emit(
+                        "TemplateType verification PASSED: "
+                        f"{len(plan.template_deployments)} triplet(s) present"
                     )
-                except json.JSONDecodeError as exc:
-                    raise DeviceError(
-                        "Device templates.json is invalid after "
-                        f"upload: {exc}"
-                    ) from exc
-
-                _verify_registry_entries(
-                    live_registry,
-                    plan.template_entries,
-                )
-
-                emit(
-                    "Registry verification PASSED: "
-                    f"{len(plan.template_entries)}/"
-                    f"{len(plan.template_entries)} "
-                    "custom entries present"
-                )
 
             emit("sync")
             remote.exec("sync", timeout=60.0)
@@ -625,15 +798,18 @@ def deploy(
             emit("upload phase complete")
         upload_succeeded = True
     finally:
-        emit("PHASE 5/5 BRAND-NEW cleanup connection: remount RO")
-        try:
-            with RemoteSession(config, log=emit, label="cleanup-ro") as remote:
-                remote.mount_state()
-                remote.exec("mount -o remount,ro /", check=False)
-                remote.mount_state()
-        except Exception as exc:
-            cleanup_error = exc
-            emit(f"WARNING cleanup failed: {type(exc).__name__}: {exc}")
+        if plan.requires_root_remount:
+            emit("PHASE 5/5 BRAND-NEW cleanup connection: remount RO")
+            try:
+                with RemoteSession(config, log=emit, label="cleanup-ro") as remote:
+                    remote.mount_state()
+                    remote.exec("mount -o remount,ro /", check=False)
+                    remote.mount_state()
+            except Exception as exc:
+                cleanup_error = exc
+                emit(f"WARNING cleanup failed: {type(exc).__name__}: {exc}")
+        else:
+            emit("PHASE 5/5 skipped: root filesystem was not remounted")
 
     if cleanup_error is not None and upload_succeeded:
         raise DeviceError(
