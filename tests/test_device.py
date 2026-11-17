@@ -1,8 +1,10 @@
 import json
+import base64
 import uuid
 
 from rmpp_manager.device import (
     _template_deployments,
+    _template_payload,
     is_template_type_firmware,
     parse_firmware_version,
     _template_metadata,
@@ -38,11 +40,21 @@ def test_template_type_deployment_uses_stable_uuid_mapping(tmp_path):
     assert mapping["templates"]["Chrissy_Notes|portrait"] == first_uuid
 
 
-def test_template_type_metadata_has_no_icon_data():
+def test_template_type_metadata_contains_svg_icon_data(tmp_path):
+    asset = tmp_path / "Chrissy_Notes.template"
+    asset.write_text(
+        json.dumps({"orientation": "portrait", "items": []}),
+        encoding="utf-8",
+    )
     metadata = json.loads(
         _template_metadata({"name": "Chrissy Notes", "filename": "Chrissy_Notes"})
     )
+    template = json.loads(_template_payload(asset))
 
     assert metadata["type"] == "TemplateType"
     assert metadata["visibleName"] == "Chrissy Notes"
     assert "iconData" not in metadata
+    assert "iconData" in template
+    svg = base64.b64decode(template["iconData"]).decode("utf-8")
+    assert '<svg' in svg
+    assert 'viewBox="0 0 150 200"' in svg

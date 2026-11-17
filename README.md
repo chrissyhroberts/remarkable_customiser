@@ -177,7 +177,8 @@ deployed as a stable-UUID triplet under
 The UUID mapping is kept in `.rmpp-template-uuids.json` beside the selected
 local templates, so redeploying a template updates the existing TemplateType
 instead of creating a duplicate. Template metadata comes from the selected
-folder's `templates.json`; no `iconData` is generated yet. Template-only
+folder's `templates.json`; each upload also embeds a base64-encoded SVG
+`iconData` icon in the native `.template` payload. Template-only
 deployments on 3.30+ do not remount `/`.
 
 ## Suspend screen

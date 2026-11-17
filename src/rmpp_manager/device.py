@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import base64
+import html
 import json
 import os
 import posixpath
@@ -635,6 +637,95 @@ def _template_metadata(entry: dict[str, Any]) -> bytes:
     return (json.dumps(metadata, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _template_payload(asset: Path) -> bytes:
+    """Return the native template JSON with its icon embedded."""
+    try:
+        template = json.loads(Path(asset).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeviceError(f"Could not read template {asset}: {exc}") from exc
+    template["iconData"] = _template_icon_data(asset)
+    return (json.dumps(template, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _template_icon_data(asset: Path) -> str:
+    """Return xochitl's base64-encoded SVG icon for a native template."""
+    try:
+        template = json.loads(Path(asset).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        template = {}
+
+    landscape = str(template.get("orientation", "portrait")).lower() == "landscape"
+    width, height = (2160, 1620) if landscape else (1620, 2160)
+    paths: list[str] = []
+
+    def number(value: Any, fallback: float = 0.0) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if text == "templateWidth":
+            return float(width)
+        if text == "templateHeight":
+            return float(height)
+        match = re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+        return float(match.group(0)) if match else fallback
+
+    def path_data(data: Any, dx: float = 0.0, dy: float = 0.0) -> str:
+        if not isinstance(data, list):
+            return ""
+        result: list[str] = []
+        index = 0
+        while index < len(data):
+            command = data[index]
+            if command in {"M", "L"} and index + 2 < len(data):
+                x = number(data[index + 1]) + dx
+                y = number(data[index + 2]) + dy
+                result.append(f"{command}{x:g},{y:g}")
+                index += 3
+            elif command == "Z":
+                result.append("Z")
+                index += 1
+            else:
+                index += 1
+        return " ".join(result)
+
+    def collect(items: Any, dx: float = 0.0, dy: float = 0.0) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "path":
+                data = path_data(item.get("data", []), dx, dy)
+                if data:
+                    stroke = html.escape(str(item.get("strokeColor", "#555555")), quote=True)
+                    paths.append(
+                        f'<path d="{data}" fill="none" stroke="{stroke}" stroke-width="12"/>'
+                    )
+            elif item.get("type") == "group":
+                box = item.get("boundingBox", {})
+                collect(
+                    item.get("children", []),
+                    dx + number(box.get("x", 0)),
+                    dy + number(box.get("y", 0)),
+                )
+
+    collect(template.get("items", []))
+    if not paths:
+        for y in range(360, height - 240, 300):
+            paths.append(f'<path d="M180,{y} L{width - 180},{y}" fill="none" stroke="#777777" stroke-width="12"/>')
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="150" height="200" '
+        'viewBox="0 0 150 200" preserveAspectRatio="none">'
+        '<rect width="150" height="200" fill="white"/>'
+        f'<g transform="scale({150 / width:g} {200 / height:g})">'
+        + "".join(paths)
+        + "</g>"
+        + "</svg>"
+    )
+    return base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
 def _reconcile_template_deployments(
     remote: RemoteSession,
     folder: Path,
@@ -696,7 +787,10 @@ def _reconcile_template_deployments(
                 mappings[key] = deployment.uuid
                 mappings_changed = True
             remote_version = _version_tuple(same_version[2].get("templateVersion"))
-            deployment.upload_template = remote_version != local_version
+            deployment.upload_template = (
+                remote_version != local_version
+                or not bool(same_version[2].get("iconData"))
+            )
     if mappings_changed:
         _save_template_uuid_map(folder, mappings)
 
@@ -1033,7 +1127,10 @@ def deploy(
                         f"({deployment.uuid})"
                     )
                     if deployment.upload_template:
-                        remote.upload_atomic(deployment.asset, deployment.template_path)
+                        remote.upload_bytes_atomic(
+                            _template_payload(deployment.asset),
+                            deployment.template_path,
+                        )
                     else:
                         emit(
                             f"Skipping {deployment.asset.name}: "
